@@ -1,0 +1,31 @@
+import { db } from '@/lib/db'
+import { requireBridgeAuth, jerr, jok } from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * GET /api/bridge/command/[id] — статус/результат команды.
+ * Ответ: { ok, status: 'pending'|'picked'|'done'|'failed', data?, error?, picked: boolean }
+ */
+export async function GET(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const { id } = await params
+  const c = await db.bridgeCommand.findUnique({ where: { id } })
+  if (!c) return jerr('Команда не найдена', 404)
+
+  return jok({
+    commandId: c.id,
+    type: c.type,
+    status: c.status,
+    picked: c.status !== 'pending',
+    ...(c.status === 'done'
+      ? { data: c.result ? (JSON.parse(c.result) as unknown) : null }
+      : {}),
+    ...(c.status === 'failed' ? { error: c.error || 'Ошибка выполнения на ПК' } : {}),
+  })
+}

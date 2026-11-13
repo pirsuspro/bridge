@@ -1,0 +1,541 @@
+"use client";
+
+// Карточка «Терминал»: запуск команд на ПК (синхронно или в фон),
+// чтение вывода фоновых процессов, перезапуск агента.
+// Требует агент моста v2.2+ (exec / exec_start / proc_* / restart).
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Loader2,
+  Play,
+  RefreshCcw,
+  Square,
+  Terminal,
+  TextCursorInput,
+  RotateCw,
+} from "lucide-react";
+
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { useToast } from "@/hooks/use-toast";
+import {
+  fetchCommand,
+  procKill,
+  procList,
+  procRead,
+  procStart,
+  restartAgent,
+  runExec,
+} from "./api";
+import { BTN_GHOST, BTN_OUTLINE, BTN_PRIMARY, CARD_DARK, INPUT_DARK } from "./styles";
+import type { ExecResult, ProcInfo } from "./types";
+
+type BlockKind = "cmd" | "out" | "err" | "meta";
+
+interface ConsoleBlock {
+  id: number;
+  kind: BlockKind;
+  text: string;
+}
+
+const TIMEOUT_OPTIONS = [
+  { value: "30", label: "30 с" },
+  { value: "120", label: "2 мин" },
+  { value: "300", label: "5 мин" },
+  { value: "600", label: "10 мин" },
+];
+
+const QUICK_COMMANDS = [
+  { label: "dir", cmd: "dir" },
+  { label: "ver", cmd: "ver" },
+  { label: "whoami", cmd: "whoami" },
+  { label: "Дата и время", cmd: "date /t & time /t" },
+];
+
+const MAX_BLOCKS = 600;
+
+const BLOCK_CLASS: Record<BlockKind, string> = {
+  cmd: "text-emerald-400",
+  out: "text-zinc-200",
+  err: "text-red-400",
+  meta: "text-zinc-500",
+};
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms} мс`;
+  return `${(ms / 1000).toFixed(1)} с`;
+}
+
+function appendExecResult(blocks: ConsoleBlock[], res: ExecResult): ConsoleBlock[] {
+  const out = [...blocks];
+  if (res.stdout) out.push({ id: 0, kind: "out", text: res.stdout.replace(/\r\n$/, "") });
+  if (res.stderr) out.push({ id: 0, kind: "err", text: res.stderr.replace(/\r\n$/, "") });
+  const parts = [`код ${res.code}`, formatDuration(res.durationMs)];
+  if (res.timedOut) parts.push("ПРЕВЫШЕН ТАЙМАУТ");
+  if (res.stdoutEnc) parts.push(res.stdoutEnc);
+  if (res.stdoutTrunc || res.stderrTrunc) parts.push("вывод обрезан");
+  out.push({ id: 0, kind: "meta", text: `── ${parts.join(" · ")} ──` });
+  return out.slice(-MAX_BLOCKS);
+}
+
+interface TerminalCardProps {
+  token: string;
+  online: boolean;
+}
+
+export function TerminalCard({ token, online }: TerminalCardProps) {
+  const { toast } = useToast();
+  const [cmd, setCmd] = useState("");
+  const [timeoutSec, setTimeoutSec] = useState("120");
+  const [bgMode, setBgMode] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [blocks, setBlocks] = useState<ConsoleBlock[]>([
+    { id: 0, kind: "meta", text: "Терминал моста v2 — команды выполняются на вашем ПК (cmd.exe)." },
+  ]);
+  const [procs, setProcs] = useState<ProcInfo[] | null>(null);
+  const [restartOpen, setRestartOpen] = useState(false);
+  const [restarting, setRestarting] = useState(false);
+
+  const blockIdRef = useRef(1);
+  const consoleRef = useRef<HTMLDivElement | null>(null);
+  const cursorsRef = useRef<Record<string, { out: number; err: number }>>({});
+  const pollTimerRef = useRef<number | null>(null);
+
+  const pushBlocks = useCallback((newBlocks: { kind: BlockKind; text: string }[]) => {
+    setBlocks((prev) => {
+      let next = [...prev];
+      for (const b of newBlocks) {
+        next.push({ id: blockIdRef.current++, kind: b.kind, text: b.text });
+      }
+      return next.slice(-MAX_BLOCKS);
+    });
+  }, []);
+
+  // Автопрокрутка консоли вниз при новом выводе
+  useEffect(() => {
+    const el = consoleRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [blocks]);
+
+  // Очистка таймера опроса долгой команды
+  useEffect(() => {
+    return () => {
+      if (pollTimerRef.current !== null) window.clearInterval(pollTimerRef.current);
+    };
+  }, []);
+
+  const refreshProcs = useCallback(async () => {
+    if (!token) return;
+    const res = await procList(token);
+    if (res.ok && res.data?.procs) setProcs(res.data.procs);
+  }, [token]);
+
+  // Периодическое обновление списка процессов
+  useEffect(() => {
+    if (!token || !online) return;
+    void refreshProcs();
+    const id = window.setInterval(() => void refreshProcs(), 15_000);
+    return () => window.clearInterval(id);
+  }, [token, online, refreshProcs]);
+
+  const handleExecResult = useCallback(
+    (res: ExecResult) => {
+      setBlocks((prev) => appendExecResult(prev, res).map((b) => (b.id === 0 ? { ...b, id: blockIdRef.current++ } : b)));
+      setRunning(false);
+    },
+    [],
+  );
+
+  const pollCommand = useCallback(
+    (commandId: string) => {
+      if (pollTimerRef.current !== null) window.clearInterval(pollTimerRef.current);
+      pollTimerRef.current = window.setInterval(async () => {
+        const res = await fetchCommand(token, commandId);
+        if (!res.ok) return; // временная ошибка — попробуем ещё раз
+        if (res.status === "done" && res.data) {
+          if (pollTimerRef.current !== null) window.clearInterval(pollTimerRef.current);
+          pollTimerRef.current = null;
+          handleExecResult(res.data);
+        } else if (res.status === "failed") {
+          if (pollTimerRef.current !== null) window.clearInterval(pollTimerRef.current);
+          pollTimerRef.current = null;
+          pushBlocks([{ kind: "err", text: res.error ?? "Команда завершилась ошибкой" }]);
+          setRunning(false);
+        }
+      }, 3_000);
+    },
+    [token, handleExecResult, pushBlocks],
+  );
+
+  const run = useCallback(async () => {
+    const text = cmd.trim();
+    if (!text || running || !token || !online) return;
+    pushBlocks([{ kind: "cmd", text: `> ${text}` }]);
+    setCmd("");
+
+    if (bgMode) {
+      const res = await procStart(token, text);
+      if (res.ok && res.data) {
+        cursorsRef.current[res.data.handle] = { out: 0, err: 0 };
+        pushBlocks([
+          { kind: "meta", text: `Запущено в фоне: ${res.data.handle} (pid ${res.data.pid})` },
+        ]);
+        void refreshProcs();
+      } else {
+        pushBlocks([{ kind: "err", text: res.error ?? "Не удалось запустить" }]);
+      }
+      return;
+    }
+
+    setRunning(true);
+    try {
+      const res = await runExec(token, { cmd: text, timeoutSec: Number(timeoutSec) });
+      if (res.ok && res.pending && res.commandId) {
+        pushBlocks([
+          { kind: "meta", text: `Команда ещё исполняется (id ${res.commandId}) — следим за ней…` },
+        ]);
+        pollCommand(res.commandId);
+        return;
+      }
+      if (res.ok && res.data) {
+        handleExecResult(res.data);
+      } else {
+        pushBlocks([{ kind: "err", text: res.error ?? "Ошибка выполнения" }]);
+        setRunning(false);
+      }
+    } catch {
+      pushBlocks([{ kind: "err", text: "Сетевая ошибка" }]);
+      setRunning(false);
+    }
+  }, [
+    cmd,
+    running,
+    token,
+    online,
+    bgMode,
+    timeoutSec,
+    pushBlocks,
+    refreshProcs,
+    pollCommand,
+    handleExecResult,
+  ]);
+
+  const readProc = useCallback(
+    async (handle: string) => {
+      const cursor = cursorsRef.current[handle] ?? { out: 0, err: 0 };
+      const res = await procRead(token, handle, cursor.out, cursor.err);
+      if (!res.ok || !res.data) {
+        pushBlocks([{ kind: "err", text: res.error ?? "Не удалось прочитать вывод" }]);
+        return;
+      }
+      const d = res.data;
+      cursorsRef.current[handle] = { out: d.nextOut, err: d.nextErr };
+      const parts: { kind: BlockKind; text: string }[] = [];
+      if (d.stdout) parts.push({ kind: "out", text: d.stdout.replace(/\r\n$/, "") });
+      if (d.stderr) parts.push({ kind: "err", text: d.stderr.replace(/\r\n$/, "") });
+      if (parts.length === 0) parts.push({ kind: "meta", text: `⟨${handle}⟩ новых строк нет` });
+      if (!d.running) {
+        parts.push({
+          kind: "meta",
+          text: `⟨${handle}⟩ процесс завершён — код ${d.exitCode ?? "?"} · ${formatDuration(d.durationMs ?? 0)}`,
+        });
+      }
+      pushBlocks(parts);
+    },
+    [token, pushBlocks],
+  );
+
+  const killProc = useCallback(
+    async (handle: string) => {
+      const res = await procKill(token, handle);
+      if (res.ok) {
+        pushBlocks([{ kind: "meta", text: `⟨${handle}⟩ остановлен` }]);
+        void refreshProcs();
+      } else {
+        toast({ title: "Не удалось остановить", description: res.error, variant: "destructive" });
+      }
+    },
+    [token, pushBlocks, refreshProcs, toast],
+  );
+
+  const handleRestart = useCallback(async () => {
+    setRestarting(true);
+    try {
+      const res = await restartAgent(token);
+      if (res.ok) {
+        toast({
+          title: "Агент перезапускается",
+          description: "Он вернётся онлайн через ~5 секунд",
+        });
+        pushBlocks([{ kind: "meta", text: "Перезапуск агента по команде из веб-интерфейса…" }]);
+      } else {
+        toast({ title: "Не удалось перезапустить", description: res.error, variant: "destructive" });
+      }
+    } finally {
+      setRestarting(false);
+      setRestartOpen(false);
+    }
+  }, [token, pushBlocks, toast]);
+
+  return (
+    <Card className={`${CARD_DARK} flex flex-col`}>
+      <CardHeader>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="min-w-0">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Terminal className="size-4 text-emerald-500" aria-hidden="true" />
+              Терминал
+            </CardTitle>
+            <CardDescription className="text-zinc-500">
+              Команды выполняются на вашем ПК через мост
+            </CardDescription>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            className={BTN_OUTLINE}
+            onClick={() => setRestartOpen(true)}
+            disabled={!online || restarting}
+            title="Перезапустить агент моста на ПК"
+          >
+            {restarting ? (
+              <Loader2 className="animate-spin" aria-hidden="true" />
+            ) : (
+              <RotateCw aria-hidden="true" />
+            )}
+            Перезапустить агент
+          </Button>
+        </div>
+      </CardHeader>
+
+      <CardContent className="flex flex-1 flex-col gap-4">
+        {/* Ввод команды */}
+        <div className="flex flex-col gap-2">
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <div className="relative min-w-0 flex-1">
+              <TextCursorInput
+                className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-zinc-600"
+                aria-hidden="true"
+              />
+              <Input
+                value={cmd}
+                onChange={(e) => setCmd(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void run();
+                  }
+                }}
+                placeholder="Например: dir или powershell -Command ..."
+                className={`${INPUT_DARK} pl-9 font-mono text-sm`}
+                disabled={!online}
+                aria-label="Команда для выполнения на ПК"
+                spellCheck={false}
+                autoComplete="off"
+              />
+            </div>
+            <div className="flex gap-2">
+              <Select value={timeoutSec} onValueChange={setTimeoutSec} disabled={!online || bgMode}>
+                <SelectTrigger
+                  className={`${INPUT_DARK} w-[7.5rem] font-mono text-sm`}
+                  aria-label="Таймаут команды"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="border-zinc-800 bg-zinc-900 text-zinc-100">
+                  {TIMEOUT_OPTIONS.map((o) => (
+                    <SelectItem key={o.value} value={o.value}>
+                      {o.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                type="button"
+                className={`${BTN_PRIMARY} w-24 shrink-0`}
+                onClick={() => void run()}
+                disabled={!online || running || !cmd.trim()}
+              >
+                {running ? (
+                  <Loader2 className="animate-spin" aria-hidden="true" />
+                ) : (
+                  <Play aria-hidden="true" />
+                )}
+                Пуск
+              </Button>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+            <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-400">
+              <Checkbox
+                checked={bgMode}
+                onCheckedChange={(v) => setBgMode(v === true)}
+                disabled={!online}
+                aria-label="Запустить в фоновом режиме"
+                className="border-zinc-600 data-[state=checked]:border-emerald-500 data-[state=checked]:bg-emerald-500"
+              />
+              В фоне (без ожидания)
+            </label>
+            <span className="text-xs text-zinc-600">|</span>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <Label className="text-xs text-zinc-500">Быстро:</Label>
+              {QUICK_COMMANDS.map((q) => (
+                <Button
+                  key={q.label}
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-7 border-zinc-700/80 bg-zinc-900/40 px-2.5 font-mono text-xs text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100"
+                  onClick={() => setCmd(q.cmd)}
+                  disabled={!online}
+                  title={q.cmd}
+                >
+                  {q.label}
+                </Button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* Консоль */}
+        <div
+          ref={consoleRef}
+          role="log"
+          aria-label="Вывод команд"
+          className="max-h-96 min-h-40 flex-1 overflow-y-auto rounded-lg border border-zinc-800 bg-zinc-950/80 p-3 font-mono text-xs leading-relaxed"
+        >
+          {blocks.map((b) => (
+            <pre key={b.id} className={`whitespace-pre-wrap break-words ${BLOCK_CLASS[b.kind]}`}>
+              {b.text}
+            </pre>
+          ))}
+          {running && (
+            <p className="flex items-center gap-2 text-zinc-500">
+              <Loader2 className="size-3 animate-spin" aria-hidden="true" />
+              исполняется…
+            </p>
+          )}
+        </div>
+
+        {/* Фоновые процессы */}
+        <div>
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <h3 className="text-sm font-medium text-zinc-300">Фоновые процессы</h3>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className={`${BTN_GHOST} h-8 gap-1.5 px-2 text-xs`}
+              onClick={() => void refreshProcs()}
+              disabled={!online}
+            >
+              <RefreshCcw className="size-3.5" aria-hidden="true" />
+              Обновить
+            </Button>
+          </div>
+          {procs === null ? (
+            <p className="text-sm text-zinc-500">
+              {online ? "Загрузка…" : "Мост офлайн — процессы недоступны"}
+            </p>
+          ) : procs.length === 0 ? (
+            <p className="text-sm text-zinc-500">Нет запущенных процессов</p>
+          ) : (
+            <ul className="flex max-h-48 flex-col gap-1.5 overflow-y-auto pr-1">
+              {procs.map((p) => (
+                <li
+                  key={p.handle}
+                  className="flex items-center gap-2 rounded-md border border-zinc-800/80 bg-zinc-950/50 px-3 py-2"
+                >
+                  <span
+                    className={`size-2 shrink-0 rounded-full ${p.running ? "bg-emerald-500" : "bg-zinc-600"}`}
+                    title={p.running ? "Работает" : "Завершён"}
+                    aria-hidden="true"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate font-mono text-xs text-zinc-300" title={p.cmd}>
+                      {p.handle} · pid {p.pid} · {p.cmd}
+                    </p>
+                    <p className="text-[11px] text-zinc-500">
+                      {p.running
+                        ? `старт ${p.startedAt}`
+                        : `завершён, код ${p.exitCode ?? "?"} · ${formatDuration(p.durationMs ?? 0)}`}
+                    </p>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 shrink-0 border-zinc-700 bg-zinc-900/60 px-2 text-xs text-zinc-200 hover:bg-zinc-800"
+                    onClick={() => void readProc(p.handle)}
+                  >
+                    Вывод
+                  </Button>
+                  {p.running && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-7 shrink-0 border-red-900/60 bg-red-950/30 px-2 text-xs text-red-300 hover:bg-red-950/60 hover:text-red-200"
+                      onClick={() => void killProc(p.handle)}
+                      aria-label={`Остановить процесс ${p.handle}`}
+                    >
+                      <Square className="size-3" aria-hidden="true" />
+                      Стоп
+                    </Button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </CardContent>
+
+      <AlertDialog open={restartOpen} onOpenChange={setRestartOpen}>
+        <AlertDialogContent className="border-zinc-800 bg-zinc-900 text-zinc-100">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Перезапустить агент моста?</AlertDialogTitle>
+            <AlertDialogDescription className="text-zinc-400">
+              Окно моста на ПК мигнёт и агент вернётся онлайн через несколько секунд. Это безопасно.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="border-zinc-700 bg-transparent text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100">
+              Отмена
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-emerald-500 text-zinc-950 hover:bg-emerald-600"
+              onClick={(e) => {
+                e.preventDefault();
+                void handleRestart();
+              }}
+            >
+              {restarting && <Loader2 className="animate-spin" aria-hidden="true" />}
+              Перезапустить
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </Card>
+  );
+}

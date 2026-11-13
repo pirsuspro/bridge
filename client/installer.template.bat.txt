@@ -1,0 +1,38 @@
+@echo off
+rem ============================================================
+rem  Z.ai Bridge - installer and watchdog
+rem  Generated automatically. Place this file in a separate
+rem  folder (for example C:\zai-bridge) and double-click it.
+rem
+rem  What it does:
+rem   1. Downloads bridge.ps1 from the bridge server (once)
+rem   2. Runs it; if it exits or crashes - restarts in 3 sec
+rem  3. Close this window to stop the bridge completely
+rem ============================================================
+
+chcp 65001 >nul
+title Z.ai Bridge
+setlocal
+set "BRIDGE_URL=__BRIDGE_URL__"
+set "BRIDGE_TOKEN=__BRIDGE_TOKEN__"
+cd /d "%~dp0"
+
+if not exist "bridge.ps1" (
+    echo [setup] Downloading bridge.ps1 from the bridge server...
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing -Uri '%BRIDGE_URL%/api/bridge/setup/ps1?t=%BRIDGE_TOKEN%' -OutFile 'bridge.ps1'"
+)
+
+if not exist "bridge.ps1" (
+    echo [setup] ERROR: could not download bridge.ps1.
+    echo [setup] Check your internet connection and make sure the bridge URL is correct.
+    pause
+    exit /b 1
+)
+
+:run
+powershell -NoProfile -ExecutionPolicy Bypass -File "bridge.ps1" -Url "%BRIDGE_URL%" -Token "%BRIDGE_TOKEN%"
+echo.
+echo [watchdog] Bridge stopped. Restarting in 3 seconds...
+echo [watchdog] Close this window to stop the bridge completely.
+timeout /t 3 /nobreak >nul
+goto run

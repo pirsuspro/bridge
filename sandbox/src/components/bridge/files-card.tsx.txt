@@ -1,0 +1,747 @@
+"use client";
+
+// Карточка «Файлы папки» — файловый менеджер моста.
+// Активна только когда мост онлайн; все операции идут через POST /api/bridge/action
+// и могут занимать до ~45 сек (сервер ждёт ответа моста).
+
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ArrowUp,
+  CircleAlert,
+  Download,
+  FileText,
+  Folder,
+  FolderOpen,
+  FolderPlus,
+  FolderX,
+  Loader2,
+  MoreHorizontal,
+  Pencil,
+  RefreshCw,
+  Trash2,
+  Upload,
+} from "lucide-react";
+
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbList,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+} from "@/components/ui/breadcrumb";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
+import { useToast } from "@/hooks/use-toast";
+import {
+  bridgeAction,
+  downloadWithToken,
+  pullFromPc,
+  pushToPc,
+  uploadStagedFile,
+  waitForTransfer,
+} from "./api";
+import { BTN_OUTLINE, BTN_PRIMARY, CARD_DARK, DIALOG_DARK, INPUT_DARK } from "./styles";
+import type { FileEntry } from "./types";
+import { formatBytes, formatMtime, joinPath, parentPath, sanitizeFileName, saveBlob } from "./utils";
+
+const ICON_BTN =
+  "size-10 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100 sm:size-9";
+
+interface FilesCardProps {
+  token: string;
+  online: boolean;
+}
+
+export function FilesCard({ token, online }: FilesCardProps) {
+  const { toast } = useToast();
+
+  const [path, setPath] = useState("");
+  const [entries, setEntries] = useState<FileEntry[]>([]);
+  const [truncated, setTruncated] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [initialLoaded, setInitialLoaded] = useState(false);
+  const [listError, setListError] = useState<string | null>(null);
+
+  const [mkdirOpen, setMkdirOpen] = useState(false);
+  const [mkdirName, setMkdirName] = useState("");
+  const [mkdirBusy, setMkdirBusy] = useState(false);
+
+  const [deleteTarget, setDeleteTarget] = useState<FileEntry | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+
+  const [moveTarget, setMoveTarget] = useState<FileEntry | null>(null);
+  const [moveOpen, setMoveOpen] = useState(false);
+  const [movePath, setMovePath] = useState("");
+  const [moveBusy, setMoveBusy] = useState(false);
+
+  const [uploading, setUploading] = useState(false);
+  const [downloading, setDownloading] = useState<string | null>(null);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const pathRef = useRef("");
+  const loadIdRef = useRef(0);
+
+  useEffect(() => {
+    pathRef.current = path;
+  }, [path]);
+
+  const loadList = useCallback(
+    async (targetPath: string) => {
+      if (!token) return;
+      const id = ++loadIdRef.current;
+      setLoading(true);
+      try {
+        const res = await bridgeAction(token, { op: "list", path: targetPath });
+        if (id !== loadIdRef.current) return;
+        if (res.ok && res.data) {
+          setEntries(res.data.entries ?? []);
+          setTruncated(Boolean(res.data.truncated));
+          setListError(null);
+        } else {
+          setEntries([]);
+          setTruncated(false);
+          setListError(res.error ?? "Не удалось получить список файлов");
+        }
+      } finally {
+        if (id === loadIdRef.current) {
+          setLoading(false);
+          setInitialLoaded(true);
+        }
+      }
+    },
+    [token],
+  );
+
+  // Загрузка списка при появлении токена/переходе в онлайн и возврате к нему.
+  useEffect(() => {
+    if (online && token) {
+      void loadList(pathRef.current);
+    }
+  }, [online, token, loadList]);
+
+  const navigate = useCallback(
+    (target: string) => {
+      setPath(target);
+      void loadList(target);
+    },
+    [loadList],
+  );
+
+  const handleRefresh = () => void loadList(pathRef.current);
+
+  /* ------------------------------ Новая папка ------------------------------ */
+
+  const handleMkdir = async () => {
+    const name = mkdirName.trim();
+    if (!name || !token || mkdirBusy) return;
+    setMkdirBusy(true);
+    try {
+      const res = await bridgeAction(token, {
+        op: "mkdir",
+        path: joinPath(pathRef.current, name),
+      });
+      if (res.ok) {
+        setMkdirOpen(false);
+        setMkdirName("");
+        toast({ title: "Папка создана", description: name });
+        handleRefresh();
+      } else {
+        toast({ title: "Не удалось создать папку", description: res.error, variant: "destructive" });
+      }
+    } finally {
+      setMkdirBusy(false);
+    }
+  };
+
+  /* -------------------------------- Загрузка ------------------------------- */
+
+  const handleFiles = async (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0 || !token) return;
+    // Важно: сначала снимаем копию файлов, и только потом сбрасываем input —
+    // очистка value у file-input опустошает живой FileList в Chromium.
+    const files = Array.from(fileList);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    setUploading(true);
+    let sent = 0;
+    const failures: string[] = [];
+    try {
+      for (const file of files) {
+        const stagedName = sanitizeFileName(file.name);
+        const targetPath = joinPath(pathRef.current, stagedName);
+        const upload = await uploadStagedFile(token, stagedName, file);
+        if (!upload.ok) {
+          failures.push(`${file.name}: ${upload.error ?? "ошибка загрузки"}`);
+          continue;
+        }
+        const push = await pushToPc(token, stagedName, targetPath);
+        if (push.ok) {
+          sent += 1;
+        } else {
+          failures.push(`${file.name}: ${push.error ?? "мост не принял файл"}`);
+        }
+      }
+    } finally {
+      setUploading(false);
+    }
+    if (sent > 0) {
+      toast({
+        title: sent === 1 ? "Файл отправляется на ПК" : `Отправляется файлов: ${sent}`,
+        description: "Прогресс — в карточке «Передачи»",
+      });
+    }
+    if (failures.length > 0) {
+      toast({
+        title: "Не удалось отправить некоторые файлы",
+        description: failures.join(" • ").slice(0, 300),
+        variant: "destructive",
+      });
+    }
+    handleRefresh();
+  };
+
+  /* ------------------------------- Скачивание ------------------------------ */
+
+  const handleDownload = async (entry: FileEntry) => {
+    if (!token || downloading) return;
+    setDownloading(entry.path);
+    try {
+      const pull = await pullFromPc(token, entry.path);
+      if (!pull.ok || !pull.transferId || !pull.stagedName) {
+        toast({
+          title: "Не удалось начать загрузку",
+          description: pull.error ?? "Мост не ответил",
+          variant: "destructive",
+        });
+        return;
+      }
+      const result = await waitForTransfer(token, pull.transferId);
+      if (result.status === "complete") {
+        const fileRes = await downloadWithToken(
+          `/api/bridge/file/${encodeURIComponent(pull.stagedName)}`,
+          token,
+        );
+        if (fileRes.ok) {
+          saveBlob(fileRes.blob, entry.name);
+          toast({ title: "Файл загружен", description: entry.name });
+        } else {
+          toast({ title: "Не удалось скачать файл", description: fileRes.error, variant: "destructive" });
+        }
+      } else if (result.status === "failed") {
+        toast({
+          title: "Передача не удалась",
+          description: result.error ?? "Мост вернул ошибку",
+          variant: "destructive",
+        });
+      } else {
+        toast({
+          title: "Передача ещё идёт",
+          description: "Следите за прогрессом в карточке «Передачи»",
+        });
+      }
+    } finally {
+      setDownloading(null);
+    }
+  };
+
+  /* --------------------------------- Удаление ------------------------------ */
+
+  const handleDelete = async () => {
+    if (!deleteTarget || !token || deleteBusy) return;
+    setDeleteBusy(true);
+    try {
+      const res = await bridgeAction(token, {
+        op: "delete",
+        path: deleteTarget.path,
+        recursive: deleteTarget.isDir,
+      });
+      if (res.ok) {
+        toast({ title: "Удалено", description: deleteTarget.name });
+        setDeleteTarget(null);
+        handleRefresh();
+      } else {
+        toast({ title: "Не удалось удалить", description: res.error, variant: "destructive" });
+      }
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
+
+  /* ---------------------------- Переименование ----------------------------- */
+
+  const openMove = (entry: FileEntry) => {
+    setMoveTarget(entry);
+    setMovePath(entry.path);
+    setMoveOpen(true);
+  };
+
+  const handleMove = async () => {
+    if (!moveTarget || !token || moveBusy) return;
+    const to = movePath.trim();
+    if (!to) return;
+    if (to === moveTarget.path) {
+      setMoveOpen(false);
+      return;
+    }
+    setMoveBusy(true);
+    try {
+      const res = await bridgeAction(token, { op: "move", path: moveTarget.path, to });
+      if (res.ok) {
+        setMoveOpen(false);
+        toast({ title: "Перемещено", description: `${moveTarget.path} → ${to}` });
+        handleRefresh();
+      } else {
+        toast({ title: "Не удалось переместить", description: res.error, variant: "destructive" });
+      }
+    } finally {
+      setMoveBusy(false);
+    }
+  };
+
+  /* --------------------------------- Рендер -------------------------------- */
+
+  const segments = useMemo(() => path.split("/").filter(Boolean), [path]);
+
+  const sortedEntries = useMemo(() => {
+    return [...entries].sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      return a.name.localeCompare(b.name, "ru");
+    });
+  }, [entries]);
+
+  return (
+    <Card className={`${CARD_DARK} flex h-full flex-col`}>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <FolderOpen className="size-4 text-emerald-500" aria-hidden="true" />
+          Файлы папки
+        </CardTitle>
+        <CardDescription className="text-zinc-500">
+          Обзор и управление папкой на вашем ПК
+        </CardDescription>
+      </CardHeader>
+
+      <CardContent className="flex flex-1 flex-col gap-4">
+        {/* Навигация */}
+        <div className="flex items-center gap-2">
+          {path !== "" && (
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              className="size-10 shrink-0 border-zinc-700 bg-zinc-900/60 text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100"
+              onClick={() => navigate(parentPath(path))}
+              aria-label="Наверх"
+              title="Наверх"
+            >
+              <ArrowUp aria-hidden="true" />
+            </Button>
+          )}
+          <Breadcrumb className="min-w-0 flex-1">
+            <BreadcrumbList className="text-zinc-400">
+              <BreadcrumbItem>
+                {path === "" ? (
+                  <BreadcrumbPage className="text-zinc-200">Папка моста</BreadcrumbPage>
+                ) : (
+                  <BreadcrumbLink
+                    href="#"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      navigate("");
+                    }}
+                    className="text-zinc-400 hover:text-emerald-400"
+                  >
+                    Папка моста
+                  </BreadcrumbLink>
+                )}
+              </BreadcrumbItem>
+              {segments.map((segment, index) => {
+                const isLast = index === segments.length - 1;
+                const target = segments.slice(0, index + 1).join("/");
+                return (
+                  <Fragment key={target}>
+                    <BreadcrumbSeparator className="text-zinc-600" />
+                    <BreadcrumbItem>
+                      {isLast ? (
+                        <BreadcrumbPage className="max-w-[40vw] truncate text-zinc-200" title={segment}>
+                          {segment}
+                        </BreadcrumbPage>
+                      ) : (
+                        <BreadcrumbLink
+                          href="#"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            navigate(target);
+                          }}
+                          className="max-w-[30vw] truncate text-zinc-400 hover:text-emerald-400"
+                          title={segment}
+                        >
+                          {segment}
+                        </BreadcrumbLink>
+                      )}
+                    </BreadcrumbItem>
+                  </Fragment>
+                );
+              })}
+            </BreadcrumbList>
+          </Breadcrumb>
+        </div>
+
+        {/* Тулбар */}
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            className={`${BTN_OUTLINE} px-3`}
+            onClick={handleRefresh}
+            disabled={!online || loading || uploading}
+            aria-label="Обновить список файлов"
+          >
+            <RefreshCw className={loading ? "animate-spin" : ""} aria-hidden="true" />
+            Обновить
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            className={`${BTN_OUTLINE} px-3`}
+            onClick={() => {
+              setMkdirName("");
+              setMkdirOpen(true);
+            }}
+            disabled={!online || uploading}
+          >
+            <FolderPlus aria-hidden="true" />
+            Новая папка
+          </Button>
+          <Button
+            type="button"
+            className={`${BTN_PRIMARY} px-3`}
+            onClick={() => fileInputRef.current?.click()}
+            disabled={!online || uploading}
+            aria-label="Загрузить файлы с песочницы на ПК"
+          >
+            {uploading ? <Loader2 className="animate-spin" aria-hidden="true" /> : <Upload aria-hidden="true" />}
+            {uploading ? "Отправка…" : "Загрузить файл"}
+          </Button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="sr-only"
+            aria-label="Выбрать файлы для загрузки на ПК"
+            tabIndex={-1}
+            onChange={(event) => void handleFiles(event.target.files)}
+          />
+        </div>
+
+        {/* Список файлов */}
+        <div className="flex-1 overflow-hidden rounded-lg border border-zinc-800/80 bg-zinc-950/40">
+          {!online ? (
+            <div className="flex min-h-[16rem] flex-col items-center justify-center gap-3 p-6 text-center">
+              <FolderX className="size-10 text-zinc-600" aria-hidden="true" />
+              <p className="text-sm text-zinc-400">Мост офлайн — запустите установщик на ПК</p>
+              <p className="text-xs text-zinc-600">Инструкция — в карточке «Подключение»</p>
+            </div>
+          ) : !initialLoaded ? (
+            <div className="flex flex-col gap-3 p-4" aria-label="Загрузка списка файлов">
+              {Array.from({ length: 6 }).map((_, index) => (
+                <div key={index} className="flex items-center gap-3">
+                  <Skeleton className="size-5 rounded-md bg-zinc-800" />
+                  <Skeleton className="h-4 flex-1 bg-zinc-800" />
+                  <Skeleton className="hidden h-4 w-16 bg-zinc-800 sm:block" />
+                  <Skeleton className="hidden h-4 w-24 bg-zinc-800 md:block" />
+                </div>
+              ))}
+            </div>
+          ) : listError !== null ? (
+            <div className="flex min-h-[16rem] flex-col items-center justify-center gap-3 p-6 text-center">
+              <CircleAlert className="size-8 text-red-500/80" aria-hidden="true" />
+              <p className="max-w-md text-sm text-zinc-400">{listError}</p>
+              <Button
+                type="button"
+                variant="outline"
+                className={BTN_OUTLINE}
+                onClick={handleRefresh}
+              >
+                <RefreshCw aria-hidden="true" />
+                Повторить
+              </Button>
+            </div>
+          ) : sortedEntries.length === 0 ? (
+            <div className="flex min-h-[16rem] flex-col items-center justify-center gap-2 p-6 text-center">
+              <FolderOpen className="size-8 text-zinc-700" aria-hidden="true" />
+              <p className="text-sm text-zinc-500">Папка пуста</p>
+            </div>
+          ) : (
+            <div
+              role="list"
+              aria-label="Файлы папки моста"
+              className={`nice-scroll max-h-96 divide-y divide-zinc-800/60 overflow-y-auto ${
+                loading ? "pointer-events-none opacity-50 transition-opacity" : "transition-opacity"
+              }`}
+            >
+              {sortedEntries.map((entry) => (
+                <div
+                  key={entry.path}
+                  role="listitem"
+                  className="flex items-center gap-3 px-3 py-1 transition-colors hover:bg-zinc-800/40"
+                >
+                  {entry.isDir ? (
+                    <Folder className="size-4 shrink-0 text-emerald-500" aria-hidden="true" />
+                  ) : (
+                    <FileText className="size-4 shrink-0 text-zinc-500" aria-hidden="true" />
+                  )}
+                  <button
+                    type="button"
+                    className="min-w-0 flex-1 py-2 text-left disabled:cursor-default"
+                    onClick={() => {
+                      if (entry.isDir) navigate(entry.path);
+                    }}
+                    disabled={!entry.isDir}
+                    aria-label={entry.isDir ? `Открыть папку ${entry.name}` : `Файл ${entry.name}`}
+                  >
+                    <span className="block truncate text-sm font-medium text-zinc-200">
+                      {entry.name}
+                    </span>
+                    <span className="block truncate text-xs text-zinc-500 sm:hidden">
+                      {entry.isDir ? "Папка" : formatBytes(entry.size)} · {formatMtime(entry.mtime)}
+                    </span>
+                  </button>
+                  <span className="hidden w-20 shrink-0 text-right font-mono text-xs text-zinc-400 sm:block">
+                    {entry.isDir ? "—" : formatBytes(entry.size)}
+                  </span>
+                  <span className="hidden w-36 shrink-0 text-right font-mono text-xs text-zinc-500 md:block">
+                    {formatMtime(entry.mtime)}
+                  </span>
+                  <div className="flex shrink-0 items-center gap-1">
+                    {!entry.isDir && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className={ICON_BTN}
+                        onClick={() => void handleDownload(entry)}
+                        disabled={downloading !== null}
+                        aria-label={`Скачать ${entry.name} с ПК`}
+                        title="Скачать с ПК"
+                      >
+                        {downloading === entry.path ? (
+                          <Loader2 className="animate-spin text-emerald-400" aria-hidden="true" />
+                        ) : (
+                          <Download aria-hidden="true" />
+                        )}
+                      </Button>
+                    )}
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className={ICON_BTN}
+                          aria-label={`Действия с ${entry.name}`}
+                        >
+                          <MoreHorizontal aria-hidden="true" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent
+                        align="end"
+                        className="border-zinc-800 bg-zinc-900 text-zinc-200"
+                      >
+                        <DropdownMenuItem onClick={() => openMove(entry)} className="gap-2">
+                          <Pencil className="size-4" aria-hidden="true" />
+                          Переименовать / переместить
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => setDeleteTarget(entry)}
+                          className="gap-2 text-red-400 focus:bg-red-950/40 focus:text-red-300"
+                        >
+                          <Trash2 className="size-4" aria-hidden="true" />
+                          Удалить
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {truncated && (
+          <p className="text-xs text-amber-500/90" role="status">
+            Показаны не все элементы папки — уточните путь.
+          </p>
+        )}
+      </CardContent>
+
+      {/* Диалог: новая папка */}
+      <Dialog
+        open={mkdirOpen}
+        onOpenChange={(open) => {
+          setMkdirOpen(open);
+          if (!open) setMkdirName("");
+        }}
+      >
+        <DialogContent className={`${DIALOG_DARK} sm:max-w-md`}>
+          <DialogHeader>
+            <DialogTitle>Новая папка</DialogTitle>
+            <DialogDescription className="text-zinc-400">
+              Будет создана в{" "}
+              {path === "" ? "корне папки моста" : `«${path}»`}. Операция выполняется через мост и
+              может занять до минуты.
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            autoFocus
+            value={mkdirName}
+            onChange={(event) => setMkdirName(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void handleMkdir();
+            }}
+            placeholder="Например: Входящие"
+            className={INPUT_DARK}
+            aria-label="Имя новой папки"
+          />
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button
+                type="button"
+                variant="outline"
+                className="border-zinc-700 bg-transparent text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100"
+              >
+                Отмена
+              </Button>
+            </DialogClose>
+            <Button
+              type="button"
+              className={BTN_PRIMARY}
+              onClick={() => void handleMkdir()}
+              disabled={!mkdirName.trim() || mkdirBusy}
+            >
+              {mkdirBusy && <Loader2 className="animate-spin" aria-hidden="true" />}
+              Создать
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Диалог: переименование / перемещение */}
+      <Dialog open={moveOpen} onOpenChange={setMoveOpen}>
+        <DialogContent className={`${DIALOG_DARK} sm:max-w-md`}>
+          <DialogHeader>
+            <DialogTitle>Переименовать / переместить</DialogTitle>
+            <DialogDescription className="text-zinc-400">
+              Новый путь относительно папки моста. Папки разделяются «/». Перемещение возможно
+              только внутри папки моста.
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            autoFocus
+            value={movePath}
+            onChange={(event) => setMovePath(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void handleMove();
+            }}
+            placeholder="Например: Документы/новое-имя.txt"
+            className={`${INPUT_DARK} font-mono`}
+            aria-label="Новый путь элемента"
+          />
+          {moveTarget && (
+            <p className="text-xs text-zinc-500">
+              Текущий путь: <span className="font-mono text-zinc-400">{moveTarget.path}</span>
+            </p>
+          )}
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button
+                type="button"
+                variant="outline"
+                className="border-zinc-700 bg-transparent text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100"
+              >
+                Отмена
+              </Button>
+            </DialogClose>
+            <Button
+              type="button"
+              className={BTN_PRIMARY}
+              onClick={() => void handleMove()}
+              disabled={!movePath.trim() || moveBusy}
+            >
+              {moveBusy && <Loader2 className="animate-spin" aria-hidden="true" />}
+              Переместить
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Подтверждение удаления */}
+      <AlertDialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteTarget(null);
+        }}
+      >
+        <AlertDialogContent className={`${DIALOG_DARK}`}>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Удалить «{deleteTarget?.name}»?</AlertDialogTitle>
+            <AlertDialogDescription className="text-zinc-400">
+              {deleteTarget?.isDir
+                ? "Папка будет удалена вместе со всем содержимым."
+                : "Файл будет удалён с вашего ПК."}{" "}
+              Действие необратимо.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="border-zinc-700 bg-transparent text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100">
+              Отмена
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-red-600 text-white hover:bg-red-500"
+              onClick={(event) => {
+                event.preventDefault();
+                void handleDelete();
+              }}
+            >
+              {deleteBusy && <Loader2 className="animate-spin" aria-hidden="true" />}
+              Удалить
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </Card>
+  );
+}

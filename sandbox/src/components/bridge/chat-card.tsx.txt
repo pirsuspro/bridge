@@ -1,0 +1,300 @@
+"use client";
+
+// Карточка «Чат с агентом»: обмен сообщениями с автономным агентом Z.ai
+// (GET/POST /api/bridge/chat). Поллинг истории — каждые 3 секунды.
+// Чат работает и при офлайн-мосте: статус online используется только
+// для подсказки, что ответ может прийти позже.
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { KeyboardEvent, UIEvent } from "react";
+import { motion } from "framer-motion";
+import { Bot, Loader2, MessageSquare, Send } from "lucide-react";
+
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Textarea } from "@/components/ui/textarea";
+import { useToast } from "@/hooks/use-toast";
+import { fetchChat, sendChatMessage } from "./api";
+import { BTN_PRIMARY, CARD_DARK } from "./styles";
+import type { ChatMessage } from "./types";
+import { formatClock } from "./utils";
+
+const CHAT_LIMIT = 100;
+const CHAT_POLL_MS = 3_000;
+/** Считаем, что пользователь «у низа», пока он не промотал выше 80px от дна. */
+const NEAR_BOTTOM_PX = 80;
+
+function PendingDot() {
+  return (
+    <span className="relative flex size-1.5 shrink-0" aria-hidden="true">
+      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-amber-400 opacity-60" />
+      <span className="relative inline-flex size-1.5 rounded-full bg-amber-500" />
+    </span>
+  );
+}
+
+function ChatBubble({ message }: { message: ChatMessage }) {
+  // Системные строки — без «пузыря», по центру.
+  if (message.role === "system") {
+    return (
+      <p className="self-center px-2 text-center text-xs italic text-zinc-500">
+        {message.text}
+      </p>
+    );
+  }
+
+  const isUser = message.role === "user";
+
+  return (
+    <div
+      className={`flex max-w-[85%] flex-col gap-1 ${isUser ? "self-end items-end" : "self-start items-start"}`}
+    >
+      <div
+        className={`rounded-xl border px-3 py-2 text-sm whitespace-pre-wrap break-words ${
+          isUser
+            ? "border-emerald-500/30 bg-emerald-500/15 text-zinc-100"
+            : "border-zinc-700/60 bg-zinc-800/70 text-zinc-200"
+        }`}
+      >
+        {message.text}
+      </div>
+      <div className="flex items-center gap-2 px-1">
+        {!isUser && (
+          <Badge
+            variant="outline"
+            className="border-emerald-800/60 bg-emerald-950/30 px-1.5 text-[9px] font-semibold uppercase tracking-wide text-emerald-400"
+          >
+            AI
+          </Badge>
+        )}
+        <span className="font-mono text-[10px] text-zinc-500">
+          {formatClock(message.createdAt)}
+        </span>
+        {isUser && message.status === "new" && (
+          <span className="inline-flex items-center gap-1 text-[10px] text-amber-400">
+            <PendingDot />
+            ожидает агента
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+interface ChatCardProps {
+  token: string;
+  /** Мост на ПК офлайн — чат всё равно работает, ответ придёт позже. */
+  online: boolean;
+}
+
+export function ChatCard({ token, online }: ChatCardProps) {
+  const { toast } = useToast();
+  const [messages, setMessages] = useState<ChatMessage[] | null>(null);
+  const [pendingCount, setPendingCount] = useState(0);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const inFlightRef = useRef(false);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const nearBottomRef = useRef(true);
+
+  const load = useCallback(async (activeToken: string, force = false) => {
+    if (inFlightRef.current && !force) return;
+    inFlightRef.current = true;
+    try {
+      const res = await fetchChat(activeToken, CHAT_LIMIT);
+      if (res.ok) {
+        setMessages(res.messages ?? []);
+        setPendingCount(res.pendingCount ?? 0);
+        setError(null);
+      } else {
+        setError(res.error ?? "Не удалось загрузить историю чата");
+      }
+    } finally {
+      inFlightRef.current = false;
+    }
+  }, []);
+
+  // Немедленная загрузка при смене токена + поллинг каждые 3 секунды.
+  useEffect(() => {
+    if (!token) {
+      setMessages(null);
+      setPendingCount(0);
+      setError(null);
+      return;
+    }
+    void load(token);
+    const id = window.setInterval(() => void load(token), CHAT_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [token, load]);
+
+  // Автопрокрутка к свежим сообщениям, если пользователь был у низа списка.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el && nearBottomRef.current) {
+      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    }
+  }, [messages]);
+
+  const handleScroll = (event: UIEvent<HTMLDivElement>) => {
+    const el = event.currentTarget;
+    nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
+  };
+
+  const canSend = Boolean(token) && !sending && input.trim().length > 0;
+
+  const handleSend = useCallback(async () => {
+    const text = input.trim();
+    if (!token || !text || sending) return;
+    setSending(true);
+    try {
+      const res = await sendChatMessage(token, text);
+      if (res.ok) {
+        setInput("");
+        await load(token, true);
+      } else {
+        // Текст сохраняем, чтобы пользователь не потерял команду.
+        toast({
+          title: "Не удалось отправить сообщение",
+          description: res.error ?? "Попробуйте позже",
+          variant: "destructive",
+        });
+      }
+    } finally {
+      setSending(false);
+    }
+  }, [input, token, sending, load, toast]);
+
+  // Enter — отправка, Shift+Enter — перенос строки.
+  const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      if (canSend) void handleSend();
+    }
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 14 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.35 }}
+      className="h-full"
+    >
+      <Card className={`${CARD_DARK} flex h-full flex-col`}>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <MessageSquare className="size-4 text-emerald-500" aria-hidden="true" />
+            Чат с агентом
+          </CardTitle>
+          <CardDescription className="text-xs text-zinc-500">
+            Команды агенту напрямую — он ответит при следующем цикле проверки
+          </CardDescription>
+          <CardAction>
+            <div className="flex items-center gap-1.5">
+              {pendingCount > 0 && (
+                <Badge
+                  variant="outline"
+                  className="border-amber-800/50 bg-amber-950/30 text-[10px] text-amber-400"
+                >
+                  {pendingCount} в обработке
+                </Badge>
+              )}
+              {!online && (
+                <Badge
+                  variant="outline"
+                  title="Ответ придёт, когда агент снова выйдет на связь"
+                  className="border-zinc-700 bg-zinc-800/50 text-[10px] text-zinc-400"
+                >
+                  агент офлайн
+                </Badge>
+              )}
+            </div>
+          </CardAction>
+        </CardHeader>
+
+        <CardContent className="flex flex-1 flex-col">
+          {error && (
+            <p className="mb-2 text-xs text-red-400" role="alert">
+              {error}
+            </p>
+          )}
+
+          {!token ? (
+            <div className="flex min-h-[10rem] flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
+              <MessageSquare className="size-8 text-zinc-700" aria-hidden="true" />
+              <p className="text-sm text-zinc-500">Введите токен моста</p>
+            </div>
+          ) : messages === null ? (
+            <div className="flex flex-col gap-2.5" aria-label="Загрузка чата">
+              <Skeleton className="h-12 w-2/3 self-start rounded-xl bg-zinc-800" />
+              <Skeleton className="h-10 w-1/2 self-end rounded-xl bg-zinc-800" />
+              <Skeleton className="h-14 w-3/5 self-start rounded-xl bg-zinc-800" />
+            </div>
+          ) : messages.length === 0 ? (
+            <div className="flex min-h-[10rem] flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
+              <Bot className="size-8 text-zinc-700" aria-hidden="true" />
+              <p className="max-w-xs text-sm text-zinc-500">
+                Напишите команду — агент Z.ai получит её через мост и ответит здесь
+              </p>
+            </div>
+          ) : (
+            <div
+              ref={scrollRef}
+              role="log"
+              aria-label="Сообщения чата с агентом"
+              onScroll={handleScroll}
+              className="nice-scroll flex max-h-80 flex-col gap-2.5 overflow-y-auto pr-1"
+            >
+              {messages.map((message) => (
+                <ChatBubble key={message.id} message={message} />
+              ))}
+            </div>
+          )}
+
+          <form
+            className="mt-3 flex items-end gap-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (canSend) void handleSend();
+            }}
+          >
+            <Textarea
+              rows={2}
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder={token ? "Команда или сообщение агенту…" : "Введите токен моста…"}
+              aria-label="Текст сообщения агенту"
+              disabled={!token}
+              className="min-h-[44px] flex-1 resize-none border-zinc-700 bg-zinc-950/60 text-zinc-100 placeholder:text-zinc-600 focus-visible:border-emerald-500/50 focus-visible:ring-emerald-500/20"
+            />
+            <Button
+              type="submit"
+              size="icon"
+              className={`${BTN_PRIMARY} size-10 shrink-0`}
+              disabled={!canSend}
+              aria-label="Отправить сообщение агенту"
+              title="Отправить (Enter)"
+            >
+              {sending ? (
+                <Loader2 className="animate-spin" aria-hidden="true" />
+              ) : (
+                <Send aria-hidden="true" />
+              )}
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
+    </motion.div>
+  );
+}

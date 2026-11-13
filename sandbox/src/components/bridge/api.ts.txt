@@ -1,0 +1,265 @@
+// Клиент API Z.ai Bridge.
+// Все запросы идут по относительным путям (один origin, порт 3000).
+// Каждый запрос, кроме GET /status, несёт заголовок x-bridge-token.
+// Бэкенд может временно отсутствовать (404/сеть) — все функции возвращают
+// { ok: false, error } вместо исключений, чтобы UI не падал.
+
+import type {
+  ActionBody,
+  ActionResult,
+  BridgeStatus,
+  ChatResponse,
+  ChatSendResponse,
+  CommandStatus,
+  ExecResponse,
+  JournalResponse,
+  ListResult,
+  LogResponse,
+  MemoryResponse,
+  ProcListResult,
+  ProcReadResult,
+  PullResponse,
+  PushResponse,
+  RotateResponse,
+  TransfersResponse,
+} from "./types";
+
+const BASE = "/api/bridge";
+
+interface ApiEnvelope {
+  ok: boolean;
+  error?: string;
+}
+
+interface RequestOptions {
+  method?: "GET" | "POST" | "PUT" | "DELETE";
+  body?: string;
+  token?: string;
+}
+
+async function request<T extends ApiEnvelope>(path: string, options: RequestOptions = {}): Promise<T> {
+  const headers = new Headers();
+  if (options.token) headers.set("x-bridge-token", options.token);
+  if (options.body !== undefined) headers.set("content-type", "application/json");
+  try {
+    const res = await fetch(path, { method: options.method ?? "GET", headers, body: options.body, cache: "no-store" });
+    const text = await res.text();
+    let data: unknown = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
+    if (data !== null && typeof data === "object" && "ok" in (data as Record<string, unknown>)) {
+      const parsed = data as T;
+      if (parsed.ok === false && !parsed.error) {
+        parsed.error = `Сервер вернул ошибку (${res.status})`;
+      }
+      return parsed;
+    }
+    return { ok: false, error: `Неожиданный ответ сервера (${res.status})` } as T;
+  } catch {
+    return { ok: false, error: "Не удалось связаться с сервером" } as T;
+  }
+}
+
+/** GET /api/bridge/status — без авторизации. */
+export function fetchBridgeStatus(): Promise<BridgeStatus> {
+  return request<BridgeStatus>(`${BASE}/status`);
+}
+
+/** POST /api/bridge/action — операции с папкой моста (до ~45 сек). */
+export function bridgeAction(token: string, body: ActionBody): Promise<ActionResult<ListResult>> {
+  return request<ActionResult<ListResult>>(`${BASE}/action`, {
+    method: "POST",
+    body: JSON.stringify(body),
+    token,
+  });
+}
+
+/** POST /api/bridge/pull — взять файл с ПК в песочницу (async-передача). */
+export function pullFromPc(token: string, path: string): Promise<PullResponse> {
+  return request<PullResponse>(`${BASE}/pull`, { method: "POST", body: JSON.stringify({ path }), token });
+}
+
+/** POST /api/bridge/push — отправить staging-файл песочницы на ПК (async-передача). */
+export function pushToPc(token: string, stagedName: string, path: string): Promise<PushResponse> {
+  return request<PushResponse>(`${BASE}/push`, { method: "POST", body: JSON.stringify({ stagedName, path }), token });
+}
+
+/** GET /api/bridge/transfers — последние 25 передач. */
+export function fetchTransfers(token: string): Promise<TransfersResponse> {
+  return request<TransfersResponse>(`${BASE}/transfers`, { token });
+}
+
+/** GET /api/bridge/log — последние 30 записей журнала. */
+export function fetchLog(token: string): Promise<LogResponse> {
+  return request<LogResponse>(`${BASE}/log`, { token });
+}
+
+/** GET /api/bridge/chat — история чата с агентом. */
+export function fetchChat(token: string, limit = 100): Promise<ChatResponse> {
+  return request<ChatResponse>(`${BASE}/chat?limit=${limit}`, { token });
+}
+
+/** POST /api/bridge/chat — отправить сообщение агенту. */
+export function sendChatMessage(token: string, text: string): Promise<ChatSendResponse> {
+  return request<ChatSendResponse>(`${BASE}/chat`, {
+    method: "POST",
+    body: JSON.stringify({ text }),
+    token,
+  });
+}
+
+/** GET /api/bridge/journal — хвост журнала прогресса агента. */
+export function fetchJournal(token: string, lines = 250): Promise<JournalResponse> {
+  return request<JournalResponse>(`${BASE}/journal?lines=${lines}`, { token });
+}
+
+/** GET /api/bridge/memory — база знаний и скиллов агента. */
+export function fetchMemory(token: string): Promise<MemoryResponse> {
+  return request<MemoryResponse>(`${BASE}/memory`, { token });
+}
+
+/** POST /api/bridge/rotate — смена токена. */
+export function rotateToken(token: string): Promise<RotateResponse> {
+  return request<RotateResponse>(`${BASE}/rotate`, { method: "POST", token });
+}
+
+/** POST /api/bridge/exec — выполнить команду на ПК (синхронно, с ожиданием). */
+export function runExec(
+  token: string,
+  body: { cmd: string; cwd?: string; timeoutSec?: number; env?: Record<string, string> },
+): Promise<ExecResponse> {
+  return request<ExecResponse>(`${BASE}/exec`, {
+    method: "POST",
+    body: JSON.stringify(body),
+    token,
+  });
+}
+
+/** GET /api/bridge/command/<id> — статус/результат команды (долгий exec). */
+export function fetchCommand(token: string, commandId: string): Promise<CommandStatus> {
+  return request<CommandStatus>(`${BASE}/command/${encodeURIComponent(commandId)}`, { token });
+}
+
+/** POST /api/bridge/proc — операции с фоновыми процессами. */
+export function procOp<T = unknown>(
+  token: string,
+  body: Record<string, unknown>,
+): Promise<ActionResult<T>> {
+  return request<ActionResult<T>>(`${BASE}/proc`, {
+    method: "POST",
+    body: JSON.stringify(body),
+    token,
+  });
+}
+
+/** Запустить фоновый процесс. */
+export function procStart(
+  token: string,
+  cmd: string,
+  cwd?: string,
+): Promise<ActionResult<{ handle: string; pid: number; cmd: string }>> {
+  return procOp(token, { op: "start", cmd, cwd });
+}
+
+/** Прочитать новый вывод фонового процесса. */
+export function procRead(
+  token: string,
+  handle: string,
+  fromOut: number,
+  fromErr: number,
+): Promise<ActionResult<ProcReadResult>> {
+  return procOp(token, { op: "read", handle, fromOut, fromErr, maxChars: 100_000 });
+}
+
+/** Остановить фоновый процесс. */
+export function procKill(token: string, handle: string): Promise<ActionResult<{ ok: boolean }>> {
+  return procOp(token, { op: "kill", handle });
+}
+
+/** Список фоновых процессов. */
+export function procList(token: string): Promise<ActionResult<ProcListResult>> {
+  return procOp<ProcListResult>(token, { op: "list" });
+}
+
+/** POST /api/bridge/agent/restart — перезапуск агента на ПК. */
+export function restartAgent(
+  token: string,
+): Promise<{ ok: boolean; error?: string; restarting?: boolean }> {
+  return request(`${BASE}/agent/restart`, { method: "POST", token });
+}
+
+/** PUT /api/bridge/file/<name> — загрузка raw-байтов в staging песочницы. */
+export async function uploadStagedFile(
+  token: string,
+  name: string,
+  file: Blob,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${BASE}/file/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      headers: { "x-bridge-token": token },
+      body: file,
+      cache: "no-store",
+    });
+    const text = await res.text();
+    try {
+      const data = JSON.parse(text) as { ok?: boolean; error?: string };
+      if (data.ok === true) return { ok: true };
+      return { ok: false, error: data.error ?? `Ошибка загрузки (${res.status})` };
+    } catch {
+      return { ok: false, error: `Неожиданный ответ сервера (${res.status})` };
+    }
+  } catch {
+    return { ok: false, error: "Не удалось связаться с сервером" };
+  }
+}
+
+export type BlobResult = { ok: true; blob: Blob; filename: string | null } | { ok: false; error: string };
+
+/** Загрузка бинарника с заголовком токена (файл настройки, staging-файл). */
+export async function downloadWithToken(url: string, token: string): Promise<BlobResult> {
+  try {
+    const res = await fetch(url, { headers: { "x-bridge-token": token }, cache: "no-store" });
+    if (!res.ok) {
+      let error = `Ошибка загрузки (${res.status})`;
+      try {
+        const data = (await res.json()) as { error?: string };
+        if (data?.error) error = data.error;
+      } catch {
+        // тело не JSON — оставляем статус
+      }
+      return { ok: false, error };
+    }
+    const disposition = res.headers.get("content-disposition") ?? "";
+    const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disposition);
+    const filename = match ? decodeURIComponent(match[1]) : null;
+    return { ok: true, blob: await res.blob(), filename };
+  } catch {
+    return { ok: false, error: "Не удалось связаться с сервером" };
+  }
+}
+
+/** Ожидание завершения async-передачи (poll /transfers). */
+export async function waitForTransfer(
+  token: string,
+  transferId: string,
+  timeoutMs = 240_000,
+  intervalMs = 2_000,
+): Promise<{ status: "complete" | "failed" | "timeout"; error?: string | null }> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const res = await fetchTransfers(token);
+    if (res.ok && res.transfers) {
+      const transfer = res.transfers.find((item) => item.id === transferId);
+      if (transfer) {
+        if (transfer.status === "complete") return { status: "complete" };
+        if (transfer.status === "failed") return { status: "failed", error: transfer.error };
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return { status: "timeout" };
+}

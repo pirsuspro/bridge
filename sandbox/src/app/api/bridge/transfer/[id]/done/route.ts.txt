@@ -1,0 +1,41 @@
+import { db } from '@/lib/db'
+import { requireBridgeAuth, jerr, jok, setSetting } from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * POST /api/bridge/transfer/[id]/done — агент на ПК подтвердил приём файла (sb2pc).
+ * Body: { sha256: string }
+ */
+export async function POST(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const { id } = await params
+  const t = await db.bridgeTransfer.findUnique({ where: { id } })
+  if (!t) return jerr('Передача не найдена', 404)
+  if (t.direction !== 'sb2pc') return jerr('Неверное направление передачи', 400)
+  if (t.status === 'complete') return jok({})
+
+  const body = (await request.json().catch(() => ({}))) as { sha256?: string }
+  const claimed = String(body.sha256 ?? '').toLowerCase()
+
+  if (t.sha256 && claimed && claimed !== t.sha256.toLowerCase()) {
+    await db.bridgeTransfer.update({
+      where: { id },
+      data: { status: 'failed', error: 'Контрольная сумма на стороне ПК не совпала' },
+    })
+    return jerr('Контрольная сумма на стороне ПК не совпала')
+  }
+
+  await db.bridgeTransfer.update({
+    where: { id },
+    data: { status: 'complete', bytesDone: t.size, error: null },
+  })
+  await setSetting('lastSeenAt', new Date().toISOString())
+
+  return jok({})
+}

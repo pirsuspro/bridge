@@ -1,0 +1,47 @@
+import fs from 'fs'
+import path from 'path'
+import { requireBridgeAuth, jerr } from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+const TEMPLATE_PATH = path.join(process.cwd(), 'bridge-client', 'installer.template.bat')
+
+/**
+ * GET /api/bridge/setup/installer?origin=https%3A%2F%2F...
+ * Генерирует zai-bridge-setup.bat с зашитыми адресом песочницы и токеном.
+ * origin передаёт UI из window.location.origin.
+ */
+export async function GET(request: Request) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const originRaw = new URL(request.url).searchParams.get('origin') || ''
+  let origin: string
+  try {
+    const u = new URL(originRaw)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('bad protocol')
+    origin = u.origin
+  } catch {
+    return jerr('Параметр origin должен быть полным URL (https://...)')
+  }
+
+  if (!fs.existsSync(TEMPLATE_PATH)) {
+    return jerr('Шаблон установщика не найден на сервере', 500)
+  }
+
+  const template = await fs.promises.readFile(TEMPLATE_PATH, 'utf8')
+  let bat = template
+    .replace(/__BRIDGE_URL__/g, origin)
+    .replace(/__BRIDGE_TOKEN__/g, token)
+  bat = bat.replace(/\r?\n/g, '\r\n')
+  const buf = Buffer.from(bat, 'utf8')
+
+  return new Response(new Uint8Array(buf), {
+    headers: {
+      'content-type': 'application/octet-stream',
+      'content-length': String(buf.length),
+      'content-disposition': 'attachment; filename="zai-bridge-setup.bat"',
+      'cache-control': 'no-store',
+    },
+  })
+}

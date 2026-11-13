@@ -1,0 +1,54 @@
+import fs from 'fs'
+import path from 'path'
+import { requireBridgeAuth, jok, jerr } from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+const MEMORY_DIR = path.join(process.cwd(), 'agent-memory')
+const MAX_FILES = 60
+const MAX_FILE_BYTES = 128 * 1024
+
+async function walk(dir: string, base: string, out: { path: string; content: string; size: number }[]) {
+  if (out.length >= MAX_FILES) return
+  let entries: fs.Dirent[]
+  try {
+    entries = await fs.promises.readdir(dir, { withFileTypes: true })
+  } catch {
+    return
+  }
+  // Сначала файлы, потом подпапки; сортировка по имени
+  entries.sort((a, b) => a.name.localeCompare(b.name))
+  for (const entry of entries) {
+    if (out.length >= MAX_FILES) return
+    const full = path.join(dir, entry.name)
+    const rel = path.relative(base, full).split(path.sep).join('/')
+    if (entry.isDirectory()) {
+      await walk(full, base, out)
+    } else if (entry.isFile() && /\.md$/i.test(entry.name)) {
+      try {
+        const stat = await fs.promises.stat(full)
+        if (stat.size > MAX_FILE_BYTES) {
+          out.push({ path: rel, content: `-- файл слишком большой (${stat.size} байт) --`, size: stat.size })
+          continue
+        }
+        const content = await fs.promises.readFile(full, 'utf8')
+        out.push({ path: rel, content, size: stat.size })
+      } catch {
+        /* пропускаем нечитаемое */
+      }
+    }
+  }
+}
+
+/**
+ * GET /api/bridge/memory — база знаний и скиллов агента (agent-memory/*.md).
+ * Только чтение; агенты пишут туда файлами.
+ */
+export async function GET(request: Request) {
+  const auth = await requireBridgeAuth(request)
+  if (!auth) return jerr('Неверный токен моста', 401)
+
+  const files: { path: string; content: string; size: number }[] = []
+  await walk(MEMORY_DIR, MEMORY_DIR, files)
+  return jok({ files, count: files.length })
+}

@@ -1,0 +1,89 @@
+// Утилиты форматирования и работы с путями/файлами.
+
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (bytes < 1024) return `${bytes} Б`;
+  const units = ["КБ", "МБ", "ГБ", "ТБ"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toLocaleString("ru-RU", { maximumFractionDigits: 1 })} ${units[unitIndex]}`;
+}
+
+/** HH:MM:SS из ISO-строки. */
+export function formatClock(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "--:--:--";
+  return date.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+/** «01.01.2025 10:00» из mtime вида "2025-01-01 10:00" или ISO. */
+export function formatMtime(mtime: string): string {
+  if (!mtime) return "—";
+  const normalized = mtime.includes("T") ? mtime : mtime.replace(" ", "T");
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return mtime;
+  const day = date.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit", year: "numeric" });
+  const time = date.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  return `${day} ${time}`;
+}
+
+/** Сборка подпути от корня папки моста ("" = корень). */
+export function joinPath(dir: string, name: string): string {
+  if (!dir) return name;
+  return `${dir}/${name}`;
+}
+
+/** Родительский подпуть: "a/b/c" -> "a/b", "a" -> "". */
+export function parentPath(path: string): string {
+  const index = path.lastIndexOf("/");
+  return index === -1 ? "" : path.slice(0, index);
+}
+
+/** Санитизация имени для staging: только [A-Za-z0-9._-], до 80 символов. */
+export function sanitizeFileName(name: string): string {
+  const cleaned = name.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 80);
+  return cleaned.length > 0 ? cleaned : "file";
+}
+
+/** Сохранение Blob под указанным именем через объектную ссылку. */
+export function saveBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.rel = "noopener";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+/** Копирование в буфер обмена с запасным вариантом для старых браузеров. */
+export async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // переходим к запасному варианту ниже
+  }
+  try {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const copied = document.execCommand("copy");
+    area.remove();
+    return copied;
+  } catch {
+    return false;
+  }
+}

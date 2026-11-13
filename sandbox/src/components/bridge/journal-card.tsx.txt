@@ -1,0 +1,290 @@
+"use client";
+
+// Карточка «Журнал и память агента»: две вкладки.
+// 1) «Журнал прогресса» — хвост markdown-журнала автономного агента
+//    (GET /api/bridge/journal), поллинг каждые 15 секунд.
+// 2) «Память агента» — файлы знаний и скиллов (GET /api/bridge/memory),
+//    поллинг каждые 30 секунд.
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { motion } from "framer-motion";
+import { Brain, ChevronDown, FileText, NotebookPen, ScrollText } from "lucide-react";
+
+import { Badge } from "@/components/ui/badge";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { fetchJournal, fetchMemory } from "./api";
+import { CARD_DARK } from "./styles";
+import type { MemoryFile } from "./types";
+import { formatBytes, formatClock } from "./utils";
+
+const JOURNAL_LINES = 250;
+const JOURNAL_POLL_MS = 15_000;
+const MEMORY_POLL_MS = 30_000;
+
+const JOURNAL_SKELETON_WIDTHS = ["w-full", "w-5/6", "w-4/6", "w-full", "w-3/4", "w-full"];
+
+interface JournalData {
+  text: string;
+  updatedAt: string | null;
+  totalLines: number;
+}
+
+function TabPlaceholder({ icon, text }: { icon: "journal" | "memory"; text: string }) {
+  const Icon = icon === "journal" ? ScrollText : Brain;
+  return (
+    <div className="flex min-h-[10rem] flex-col items-center justify-center gap-2 p-6 text-center">
+      <Icon className="size-8 text-zinc-700" aria-hidden="true" />
+      <p className="text-sm text-zinc-500">{text}</p>
+    </div>
+  );
+}
+
+function MemoryFileItem({ file }: { file: MemoryFile }) {
+  const [open, setOpen] = useState(false);
+  const group =
+    file.path.startsWith("skills/")
+      ? "скилл"
+      : file.path.startsWith("knowledge/")
+        ? "знание"
+        : null;
+
+  return (
+    <Collapsible
+      open={open}
+      onOpenChange={setOpen}
+      className="rounded-lg border border-zinc-800 bg-zinc-900/40"
+    >
+      <CollapsibleTrigger
+        className="flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-left hover:bg-zinc-800/40 focus-visible:ring-2 focus-visible:ring-emerald-500/30 focus-visible:outline-none"
+        aria-label={
+          open
+            ? `Скрыть содержимое файла ${file.path}`
+            : `Показать содержимое файла ${file.path}`
+        }
+      >
+        <FileText className="size-3.5 shrink-0 text-zinc-500" aria-hidden="true" />
+        <span
+          className="min-w-0 flex-1 truncate font-mono text-xs text-emerald-400/80"
+          title={file.path}
+        >
+          {file.path}
+        </span>
+        {group && (
+          <Badge
+            variant="outline"
+            className="shrink-0 border-zinc-700 bg-zinc-800/60 text-[10px] text-zinc-300"
+          >
+            {group}
+          </Badge>
+        )}
+        <span className="shrink-0 text-[10px] text-zinc-500">
+          {formatBytes(file.size)}
+        </span>
+        <ChevronDown
+          className={`size-3.5 shrink-0 text-zinc-500 transition-transform duration-200 ${open ? "rotate-180" : ""}`}
+          aria-hidden="true"
+        />
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <pre
+          className="nice-scroll max-h-72 overflow-y-auto border-t border-zinc-800 p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-zinc-300"
+          aria-label={`Содержимое файла ${file.path}`}
+        >
+          {file.content || "— файл пуст —"}
+        </pre>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+interface JournalCardProps {
+  token: string;
+}
+
+export function JournalCard({ token }: JournalCardProps) {
+  const [journal, setJournal] = useState<JournalData | null>(null);
+  const [journalError, setJournalError] = useState<string | null>(null);
+  const [memory, setMemory] = useState<MemoryFile[] | null>(null);
+  const [memoryError, setMemoryError] = useState<string | null>(null);
+
+  const journalInFlightRef = useRef(false);
+  const memoryInFlightRef = useRef(false);
+
+  const loadJournal = useCallback(async (activeToken: string) => {
+    if (journalInFlightRef.current) return;
+    journalInFlightRef.current = true;
+    try {
+      const res = await fetchJournal(activeToken, JOURNAL_LINES);
+      if (res.ok) {
+        setJournal({
+          text: res.text ?? "",
+          updatedAt: res.updatedAt ?? null,
+          totalLines: res.totalLines ?? 0,
+        });
+        setJournalError(null);
+      } else {
+        setJournalError(res.error ?? "Не удалось загрузить журнал");
+      }
+    } finally {
+      journalInFlightRef.current = false;
+    }
+  }, []);
+
+  const loadMemory = useCallback(async (activeToken: string) => {
+    if (memoryInFlightRef.current) return;
+    memoryInFlightRef.current = true;
+    try {
+      const res = await fetchMemory(activeToken);
+      if (res.ok) {
+        setMemory(res.files ?? []);
+        setMemoryError(null);
+      } else {
+        setMemoryError(res.error ?? "Не удалось загрузить память агента");
+      }
+    } finally {
+      memoryInFlightRef.current = false;
+    }
+  }, []);
+
+  // Журнал: немедленно при смене токена + поллинг каждые 15 секунд.
+  useEffect(() => {
+    if (!token) {
+      setJournal(null);
+      setJournalError(null);
+      return;
+    }
+    void loadJournal(token);
+    const id = window.setInterval(() => void loadJournal(token), JOURNAL_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [token, loadJournal]);
+
+  // Память: немедленно при смене токена + поллинг каждые 30 секунд.
+  useEffect(() => {
+    if (!token) {
+      setMemory(null);
+      setMemoryError(null);
+      return;
+    }
+    void loadMemory(token);
+    const id = window.setInterval(() => void loadMemory(token), MEMORY_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [token, loadMemory]);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 14 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.35 }}
+      className="h-full"
+    >
+      <Card className={`${CARD_DARK} flex h-full flex-col`}>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <NotebookPen className="size-4 text-emerald-500" aria-hidden="true" />
+            Журнал и память агента
+          </CardTitle>
+          <CardDescription className="text-xs text-zinc-500">
+            Что делает агент и что он запомнил
+          </CardDescription>
+        </CardHeader>
+
+        <CardContent className="flex flex-1 flex-col">
+          <Tabs defaultValue="journal" className="gap-3">
+            <TabsList className="border border-zinc-800 bg-zinc-900">
+              <TabsTrigger
+                value="journal"
+                className="gap-1.5 text-zinc-400 data-[state=active]:text-zinc-100"
+              >
+                <ScrollText className="size-3.5" aria-hidden="true" />
+                Журнал прогресса
+              </TabsTrigger>
+              <TabsTrigger
+                value="memory"
+                className="gap-1.5 text-zinc-400 data-[state=active]:text-zinc-100"
+              >
+                <Brain className="size-3.5" aria-hidden="true" />
+                Память агента
+              </TabsTrigger>
+            </TabsList>
+
+            {/* Вкладка 1: журнал прогресса */}
+            <TabsContent value="journal" className="flex flex-col gap-2">
+              {journalError && (
+                <p className="text-xs text-red-400" role="alert">
+                  {journalError}
+                </p>
+              )}
+              {!token ? (
+                <TabPlaceholder icon="journal" text="Введите токен моста" />
+              ) : journal === null ? (
+                <div className="flex flex-col gap-2" aria-label="Загрузка журнала прогресса">
+                  {JOURNAL_SKELETON_WIDTHS.map((width, index) => (
+                    <Skeleton key={index} className={`h-3 bg-zinc-800 ${width}`} />
+                  ))}
+                </div>
+              ) : journal.text.trim().length > 0 ? (
+                <>
+                  <pre
+                    className="nice-scroll max-h-96 overflow-y-auto rounded-lg border border-zinc-800 bg-zinc-950/60 p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-zinc-300"
+                    aria-label="Текст журнала прогресса агента"
+                  >
+                    {journal.text}
+                  </pre>
+                  <p className="text-[11px] text-zinc-500">
+                    Обновлено:{" "}
+                    {journal.updatedAt ? formatClock(journal.updatedAt) : "—"} ·{" "}
+                    {journal.totalLines} строк
+                  </p>
+                </>
+              ) : (
+                <TabPlaceholder icon="journal" text="Журнал пока пуст" />
+              )}
+            </TabsContent>
+
+            {/* Вкладка 2: память агента */}
+            <TabsContent value="memory" className="flex flex-col gap-2">
+              {memoryError && (
+                <p className="text-xs text-red-400" role="alert">
+                  {memoryError}
+                </p>
+              )}
+              {!token ? (
+                <TabPlaceholder icon="memory" text="Введите токен моста" />
+              ) : memory === null ? (
+                <div className="flex flex-col gap-2" aria-label="Загрузка памяти агента">
+                  <Skeleton className="h-10 w-full bg-zinc-800" />
+                  <Skeleton className="h-10 w-5/6 bg-zinc-800" />
+                  <Skeleton className="h-10 w-4/6 bg-zinc-800" />
+                </div>
+              ) : memory.length === 0 ? (
+                <TabPlaceholder icon="memory" text="Память агента пуста" />
+              ) : (
+                <div
+                  className="nice-scroll flex max-h-96 flex-col gap-2 overflow-y-auto pr-1"
+                  aria-label="Файлы памяти агента"
+                >
+                  {memory.map((file) => (
+                    <MemoryFileItem key={file.path} file={file} />
+                  ))}
+                </div>
+              )}
+            </TabsContent>
+          </Tabs>
+        </CardContent>
+      </Card>
+    </motion.div>
+  );
+}

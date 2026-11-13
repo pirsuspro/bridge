@@ -1,0 +1,227 @@
+import fs from 'fs'
+import zlib from 'zlib'
+import { db } from '@/lib/db'
+import {
+  requireBridgeAuth,
+  jerr,
+  jok,
+  appendChunk,
+  ensureDirs,
+  stagedPath,
+  tmpPath,
+  setSetting,
+  getSetting,
+  sleep,
+  CHUNK_SIZE,
+  MAX_CHUNK_B64,
+} from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+async function loadTransfer(id: string) {
+  return db.bridgeTransfer.findUnique({ where: { id } })
+}
+
+/**
+ * Сервисный режим: «подвесить» ответ на чанк, чтобы агент v1.x остановился
+ * в chunk-цикле и его внутренний watchdog перезапустил процесс (подхватится
+ * уже обновлённый bridge.ps1). Флаг hangChunksUntil ставится через
+ * POST /api/bridge/agent/legacy-restart и снимается автоматически по протухании.
+ */
+async function hangIfRequested(): Promise<void> {
+  const untilRaw = await getSetting('hangChunksUntil')
+  if (!untilRaw) return
+  const until = new Date(untilRaw).getTime()
+  if (!Number.isFinite(until)) {
+    await setSetting('hangChunksUntil', '')
+    return
+  }
+  while (Date.now() < until) {
+    await sleep(5000)
+  }
+  await setSetting('hangChunksUntil', '')
+}
+
+/**
+ * POST /api/bridge/transfer/[id]/chunk — агент на ПК отправляет чанк файла (pc2sb).
+ * Два формата (v2.3):
+ *  1) бинарный: Content-Type: application/octet-stream, ?index=N[&gz=1],
+ *     тело — сырые (или gzip) байты чанка;
+ *  2) легаси JSON: { index: number, dataB64: string } (v2.2 и старше).
+ */
+export async function POST(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const { id } = await params
+  const t = await loadTransfer(id)
+  if (!t) return jerr('Передача не найдена', 404)
+  if (t.direction !== 'pc2sb') return jerr('Неверное направление передачи', 400)
+  if (t.status !== 'active' && t.status !== 'pending') {
+    return jerr(`Передача уже завершена (${t.status})`, 400)
+  }
+
+  await hangIfRequested()
+
+  const url = new URL(request.url)
+  const contentType = request.headers.get('content-type') || ''
+  let index: number
+  let buf: Buffer
+
+  if (contentType.includes('application/octet-stream')) {
+    // --- v2.3: бинарный чанк ---
+    index = Number(url.searchParams.get('index'))
+    if (!Number.isInteger(index) || index < 0) return jerr('Некорректный index')
+    const raw = Buffer.from(await request.arrayBuffer())
+    if (raw.length === 0) return jerr('Пустой чанк')
+    if (raw.length > 16 * 1024 * 1024) return jerr('Чанк слишком большой', 413)
+    if (url.searchParams.get('gz') === '1') {
+      try {
+        buf = zlib.gunzipSync(raw)
+      } catch {
+        return jerr('Некорректный gzip-чанк')
+      }
+      if (buf.length > 16 * 1024 * 1024) return jerr('Чанк слишком большой', 413)
+    } else {
+      buf = raw
+    }
+  } else {
+    // --- легаси JSON (v2.2-) ---
+    const body = (await request.json().catch(() => ({}))) as {
+      index?: number
+      dataB64?: string
+    }
+    index = Number(body.index)
+    if (!Number.isInteger(index) || index < 0) return jerr('Некорректный index')
+    const dataB64 = String(body.dataB64 ?? '')
+    if (!dataB64) return jerr('Пустой чанк')
+    if (dataB64.length > MAX_CHUNK_B64) return jerr('Чанк слишком большой', 413)
+    try {
+      buf = Buffer.from(dataB64, 'base64')
+    } catch {
+      return jerr('Некорректный base64')
+    }
+    if (buf.length === 0) return jerr('Пустой чанк')
+    if (buf.length > 16 * 1024 * 1024) return jerr('Чанк слишком большой', 413)
+  }
+
+  if (index !== t.chunksDone) {
+    return jerr(`Нарушен порядок чанков: ожидался ${t.chunksDone}, получен ${index}`)
+  }
+
+  ensureDirs()
+  await appendChunk(id, buf)
+
+  const bytesDone = t.bytesDone + buf.length
+  if (t.size > 0 && bytesDone > t.size) {
+    await db.bridgeTransfer.update({
+      where: { id },
+      data: { status: 'failed', error: 'Получено больше байт, чем заявлено' },
+    })
+    await fs.promises.rm(tmpPath(id), { force: true }).catch(() => {})
+    return jerr('Превышен заявленный размер файла')
+  }
+
+  await db.bridgeTransfer.update({
+    where: { id },
+    data: { bytesDone, chunksDone: index + 1, status: 'active' },
+  })
+  await setSetting('lastSeenAt', new Date().toISOString())
+
+  return jok({ received: bytesDone })
+}
+
+/**
+ * GET /api/bridge/transfer/[id]/chunk?index=N — агент на ПК ТЯНЕТ чанк (sb2pc).
+ * Два формата (v2.3):
+ *  1) бинарный: &bin=1[&gz=1] — сырые байты (или gzip, если выгодно),
+ *     метаданные в заголовках x-index / x-last / x-eof / x-gz;
+ *  2) легаси JSON: { index, dataB64, last } / { eof: true } (v2.2 и старше).
+ */
+export async function GET(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const { id } = await params
+  const t = await loadTransfer(id)
+  if (!t) return jerr('Передача не найдена', 404)
+  if (t.direction !== 'sb2pc') return jerr('Неверное направление передачи', 400)
+  if (t.status !== 'active' && t.status !== 'pending') {
+    return jok({ eof: true, status: t.status })
+  }
+
+  const src = stagedPath(t.stagedName)
+  if (!fs.existsSync(src)) {
+    await db.bridgeTransfer.update({
+      where: { id },
+      data: { status: 'failed', error: 'Файл-источник отсутствует в песочнице' },
+    })
+    return jerr('Файл-источник отсутствует в песочнице', 410)
+  }
+  const size = fs.statSync(src).size
+
+  const url = new URL(request.url)
+  const bin = url.searchParams.get('bin') === '1'
+
+  if (size === 0) {
+    if (bin) return binaryChunkResponse(Buffer.alloc(0), 0, true, false)
+    return jok({ eof: true })
+  }
+
+  const index = Number(url.searchParams.get('index'))
+  if (!Number.isInteger(index) || index < 0) return jerr('Некорректный index')
+  const totalChunks = Math.ceil(size / CHUNK_SIZE)
+  const isLast = index === totalChunks - 1
+  if (index >= totalChunks) {
+    if (bin) return binaryChunkResponse(Buffer.alloc(0), index, true, false)
+    return jok({ eof: true })
+  }
+
+  const start = index * CHUNK_SIZE
+  const len = Math.min(CHUNK_SIZE, size - start)
+  const fh = await fs.promises.open(src, 'r')
+  try {
+    const buf = Buffer.alloc(len)
+    await fh.read(buf, 0, len, start)
+    await setSetting('lastSeenAt', new Date().toISOString())
+    if (bin) {
+      let body = buf
+      let gz = false
+      if (url.searchParams.get('gz') === '1' && buf.length > 512) {
+        const packed = zlib.gzipSync(buf, { level: 6 })
+        if (packed.length < buf.length - 64) {
+          body = packed
+          gz = true
+        }
+      }
+      return binaryChunkResponse(body, index, false, gz, isLast)
+    }
+    return jok({
+      index,
+      dataB64: buf.toString('base64'),
+      last: isLast,
+    })
+  } finally {
+    await fh.close()
+  }
+}
+
+function binaryChunkResponse(body: Buffer, index: number, eof: boolean, gz: boolean, last = false) {
+  return new Response(new Uint8Array(body), {
+    headers: {
+      'content-type': 'application/octet-stream',
+      'content-length': String(body.length),
+      'x-index': String(index),
+      'x-eof': eof ? '1' : '0',
+      'x-gz': gz ? '1' : '0',
+      'x-last': last ? '1' : '0',
+      'cache-control': 'no-store',
+    },
+  })
+}

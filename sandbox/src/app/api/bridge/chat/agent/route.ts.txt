@@ -1,0 +1,48 @@
+import { db } from '@/lib/db'
+import { requireBridgeAuth, jok, jerr } from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+const MAX_TEXT_CHARS = 8000
+
+/**
+ * POST /api/bridge/chat/agent {text, meta?} — ответ агента в чат.
+ * Помечает все необработанные user-сообщения как processed.
+ * Используется ИИ-агентом песочницы (через cron-цикл или вручную).
+ */
+export async function POST(request: Request) {
+  const auth = await requireBridgeAuth(request)
+  if (!auth) return jerr('Неверный токен моста', 401)
+
+  let body: { text?: unknown; meta?: unknown }
+  try {
+    body = (await request.json()) as { text?: unknown; meta?: unknown }
+  } catch {
+    return jerr('Некорректный JSON')
+  }
+
+  const text = String(body.text ?? '')
+    .trim()
+    .slice(0, MAX_TEXT_CHARS)
+  if (!text) return jerr('Пустое сообщение')
+
+  let meta: string | null = null
+  if (body.meta !== undefined && body.meta !== null) {
+    try {
+      meta = JSON.stringify(body.meta).slice(0, 8000)
+    } catch {
+      meta = null
+    }
+  }
+
+  const msg = await db.bridgeChatMessage.create({
+    data: { role: 'agent', text, meta, status: 'processed' },
+  })
+
+  const res = await db.bridgeChatMessage.updateMany({
+    where: { role: 'user', status: 'new' },
+    data: { status: 'processed', processedAt: new Date() },
+  })
+
+  return jok({ id: msg.id, processedCount: res.count })
+}

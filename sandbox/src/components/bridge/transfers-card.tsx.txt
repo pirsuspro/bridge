@@ -1,0 +1,206 @@
+"use client";
+
+// Карточка «Передачи»: поллинг GET /api/bridge/transfers.
+// 2 сек, пока есть активные (pending/active) передачи, иначе 6 сек.
+
+import { useEffect, useRef, useState } from "react";
+import { ArrowDownToLine, ArrowLeftRight, ArrowUpFromLine } from "lucide-react";
+
+import { Badge } from "@/components/ui/badge";
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
+import { Skeleton } from "@/components/ui/skeleton";
+import { fetchTransfers } from "./api";
+import { CARD_DARK } from "./styles";
+import type { Transfer, TransferStatus } from "./types";
+import { formatBytes, formatClock } from "./utils";
+
+const STATUS_META: Record<TransferStatus, { label: string; className: string }> = {
+  pending: { label: "Ожидает", className: "border-amber-800/50 bg-amber-950/30 text-amber-400" },
+  active: { label: "Активна", className: "border-amber-700/60 bg-amber-950/50 text-amber-300" },
+  complete: { label: "Завершена", className: "border-emerald-800/50 bg-emerald-950/30 text-emerald-400" },
+  failed: { label: "Ошибка", className: "border-red-900/60 bg-red-950/40 text-red-400" },
+};
+
+function TransferProgress({ transfer }: { transfer: Transfer }) {
+  const pct =
+    transfer.size > 0 ? Math.min(100, Math.round((transfer.bytesDone / transfer.size) * 100)) : null;
+
+  if (transfer.status === "failed") {
+    return (
+      <Progress
+        value={pct ?? 100}
+        className="h-1.5 bg-zinc-800 [&_[data-slot=progress-indicator]]:bg-red-500"
+      />
+    );
+  }
+  if (transfer.status === "complete") {
+    return (
+      <Progress
+        value={100}
+        className="h-1.5 bg-zinc-800 [&_[data-slot=progress-indicator]]:bg-emerald-500"
+      />
+    );
+  }
+  if (pct === null) {
+    // size неизвестен — неопределённый прогресс
+    return (
+      <div
+        className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-800"
+        role="progressbar"
+        aria-label="Передача выполняется"
+      >
+        <div className="bridge-indeterminate h-full w-1/4 rounded-full bg-emerald-500" />
+      </div>
+    );
+  }
+  return (
+    <Progress
+      value={pct}
+      className="h-1.5 bg-zinc-800 [&_[data-slot=progress-indicator]]:bg-emerald-500"
+      aria-valuetext={`${pct}%`}
+    />
+  );
+}
+
+interface TransfersCardProps {
+  token: string;
+}
+
+export function TransfersCard({ token }: TransfersCardProps) {
+  const [transfers, setTransfers] = useState<Transfer[] | null>(null);
+  const [hasActive, setHasActive] = useState(false);
+  const hasActiveRef = useRef(false);
+
+  useEffect(() => {
+    if (!token) {
+      return;
+    }
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const tick = async () => {
+      const res = await fetchTransfers(token);
+      if (cancelled) return;
+      if (res.ok && res.transfers) {
+        setTransfers(res.transfers);
+        const active = res.transfers.some((t) => t.status === "pending" || t.status === "active");
+        hasActiveRef.current = active;
+        setHasActive(active);
+      }
+      timer = setTimeout(() => void tick(), hasActiveRef.current ? 2_000 : 6_000);
+    };
+
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [token]);
+
+  return (
+    <Card className={`${CARD_DARK} flex h-full flex-col`}>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <ArrowLeftRight className="size-4 text-emerald-500" aria-hidden="true" />
+          Передачи
+        </CardTitle>
+        <CardDescription className="text-zinc-500">
+          Файлы между ПК и песочницей
+        </CardDescription>
+        <CardAction>
+          {hasActive && (
+            <Badge
+              variant="outline"
+              className="gap-1.5 border-amber-800/50 bg-amber-950/30 text-amber-400"
+            >
+              <span className="relative flex size-1.5" aria-hidden="true">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-amber-400 opacity-60" />
+                <span className="relative inline-flex size-1.5 rounded-full bg-amber-500" />
+              </span>
+              Идут передачи
+            </Badge>
+          )}
+        </CardAction>
+      </CardHeader>
+
+      <CardContent className="flex-1">
+        {!token ? (
+          <div className="flex min-h-[10rem] flex-col items-center justify-center gap-2 p-6 text-center">
+            <ArrowLeftRight className="size-8 text-zinc-700" aria-hidden="true" />
+            <p className="text-sm text-zinc-500">Ожидание доступа к сервису…</p>
+          </div>
+        ) : transfers === null ? (
+          <div className="flex flex-col gap-3" aria-label="Загрузка списка передач">
+            {Array.from({ length: 3 }).map((_, index) => (
+              <div key={index} className="flex flex-col gap-2">
+                <Skeleton className="h-4 w-2/3 bg-zinc-800" />
+                <Skeleton className="h-1.5 w-full bg-zinc-800" />
+              </div>
+            ))}
+          </div>
+        ) : transfers.length === 0 ? (
+          <div className="flex min-h-[10rem] flex-col items-center justify-center gap-2 p-6 text-center">
+            <ArrowLeftRight className="size-8 text-zinc-700" aria-hidden="true" />
+            <p className="text-sm text-zinc-500">Передач пока нет</p>
+          </div>
+        ) : (
+          <ul
+            className="nice-scroll max-h-96 divide-y divide-zinc-800/60 overflow-y-auto"
+            aria-label="Список передач"
+          >
+            {transfers.map((transfer) => {
+              const meta = STATUS_META[transfer.status];
+              return (
+                <li key={transfer.id} className="flex items-start gap-3 px-1 py-3">
+                  <span className="mt-0.5 shrink-0" aria-hidden="true">
+                    {transfer.direction === "pc2sb" ? (
+                      <ArrowDownToLine className="size-4 text-emerald-500" />
+                    ) : (
+                      <ArrowUpFromLine className="size-4 text-amber-500" />
+                    )}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="min-w-0 truncate text-sm text-zinc-200" title={transfer.path}>
+                        {transfer.path}
+                      </span>
+                      <span className="shrink-0 font-mono text-[11px] text-zinc-500">
+                        {formatClock(transfer.createdAt)}
+                      </span>
+                    </div>
+                    <div className="mt-1.5 flex items-center gap-2">
+                      <div className="min-w-0 flex-1">
+                        <TransferProgress transfer={transfer} />
+                      </div>
+                      <Badge variant="outline" className={`shrink-0 ${meta.className}`}>
+                        {meta.label}
+                      </Badge>
+                    </div>
+                    <p className="mt-1 text-[11px] text-zinc-500">
+                      {transfer.direction === "pc2sb" ? "ПК → песочница" : "песочница → ПК"}
+                      {transfer.size > 0 &&
+                        ` · ${formatBytes(transfer.bytesDone)} / ${formatBytes(transfer.size)}`}
+                    </p>
+                    {transfer.status === "failed" && transfer.error && (
+                      <p className="mt-0.5 truncate text-xs text-red-400" title={transfer.error}>
+                        {transfer.error}
+                      </p>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </CardContent>
+    </Card>
+  );
+}

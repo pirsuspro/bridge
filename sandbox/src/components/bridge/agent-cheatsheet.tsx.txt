@@ -1,0 +1,141 @@
+"use client";
+
+// Секция «Шпаргалка для агента»: сворачиваемый блок с curl-командами.
+// Текст фиксирован контрактом; <TOKEN> подставляется из состояния страницы.
+
+import { useState } from "react";
+import { Check, ChevronRight, Copy, Terminal } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+} from "@/components/ui/card";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import { useToast } from "@/hooks/use-toast";
+import { CARD_DARK } from "./styles";
+import { copyToClipboard } from "./utils";
+
+function buildCheat(token: string): string {
+  const t = token || "<TOKEN>";
+  return [
+    `T=${t}`,
+    "",
+    "# Список файлов в папке моста",
+    "curl -s -X POST http://localhost:3000/api/bridge/action \\",
+    '  -H "x-bridge-token: $T" -H "content-type: application/json" \\',
+    "  -d '{\"op\":\"list\",\"path\":\"\"}'",
+    "",
+    "# Взять файл с ПК (появится в db/bridge-files/)",
+    "curl -s -X POST http://localhost:3000/api/bridge/pull \\",
+    '  -H "x-bridge-token: $T" -H "content-type: application/json" \\',
+    "  -d '{\"path\":\"Документы/отчёт.docx\"}'",
+    "",
+    "# Прогресс передач",
+    "curl -s http://localhost:3000/api/bridge/transfers -H \"x-bridge-token: $T\"",
+    "",
+    "# Отправить файл на ПК (сначала в staging, потом push)",
+    "curl -T /путь/к/файлу.zip \"http://localhost:3000/api/bridge/file/report.zip\" \\",
+    '  -H "x-bridge-token: $T"',
+    "curl -s -X POST http://localhost:3000/api/bridge/push \\",
+    '  -H "x-bridge-token: $T" -H "content-type: application/json" \\',
+    "  -d '{\"stagedName\":\"report.zip\",\"path\":\"Входящие/report.zip\"}'",
+    "",
+    "# Чат: проверить новые сообщения пользователя",
+    "curl -s http://localhost:3000/api/bridge/chat/pending -H \"x-bridge-token: $T\"",
+    "",
+    "# Чат: ответить пользователю (пометит его сообщения обработанными)",
+    "curl -s -X POST http://localhost:3000/api/bridge/chat/agent \\",
+    '  -H "x-bridge-token: $T" -H "content-type: application/json" \\',
+    '  -d \'{"text":"Готово!"}\'',
+    "",
+    "# Журнал прогресса и память агента (читать из песочницы)",
+    "curl -s \"http://localhost:3000/api/bridge/journal\" -H \"x-bridge-token: $T\"",
+    "",
+    "# Статус моста",
+    "curl -s http://localhost:3000/api/bridge/status",
+  ].join("\n");
+}
+
+interface AgentCheatsheetProps {
+  token: string;
+}
+
+export function AgentCheatsheet({ token }: AgentCheatsheetProps) {
+  const { toast } = useToast();
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const cheatText = buildCheat(token);
+
+  const handleCopy = async () => {
+    const ok = await copyToClipboard(cheatText);
+    if (ok) {
+      setCopied(true);
+      toast({ title: "Команды скопированы" });
+      window.setTimeout(() => setCopied(false), 2000);
+    } else {
+      toast({
+        title: "Не удалось скопировать",
+        description: "Выделите текст в блоке и скопируйте вручную",
+        variant: "destructive",
+      });
+    }
+  };
+
+  return (
+    <section aria-label="Шпаргалка для агента">
+      <Collapsible open={open} onOpenChange={setOpen}>
+        <Card className={`${CARD_DARK} py-0`}>
+          <CollapsibleTrigger asChild>
+            <button
+              type="button"
+              className="flex w-full items-center gap-3 rounded-xl px-6 py-4 text-left transition-colors hover:bg-zinc-800/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40"
+              aria-expanded={open}
+              aria-controls="agent-cheatsheet-content"
+            >
+              <Terminal className="size-4 shrink-0 text-emerald-500" aria-hidden="true" />
+              <span className="flex-1 text-sm font-semibold text-zinc-100">
+                Команды агента (curl)
+              </span>
+              <ChevronRight
+                className={`size-4 shrink-0 text-zinc-500 transition-transform duration-200 ${
+                  open ? "rotate-90" : ""
+                }`}
+                aria-hidden="true"
+              />
+            </button>
+          </CollapsibleTrigger>
+          <CollapsibleContent id="agent-cheatsheet-content">
+            <div className="relative border-t border-zinc-800/60 px-6 py-4">
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className="absolute right-8 top-7 size-8 border-zinc-700 bg-zinc-900/60 text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100"
+                onClick={() => void handleCopy()}
+                aria-label="Скопировать команды"
+                title="Скопировать команды"
+              >
+                {copied ? (
+                  <Check className="size-3.5 text-emerald-500" aria-hidden="true" />
+                ) : (
+                  <Copy className="size-3.5" aria-hidden="true" />
+                )}
+              </Button>
+              <pre className="nice-scroll overflow-x-auto rounded-lg border border-zinc-800/80 bg-zinc-950/70 p-4 pr-14 font-mono text-xs leading-relaxed text-zinc-300">
+                {cheatText}
+              </pre>
+              <p className="mt-2 text-[11px] text-zinc-600">
+                Подставлен ваш текущий токен. Команды выполняются из консоли песочницы.
+              </p>
+            </div>
+          </CollapsibleContent>
+        </Card>
+      </Collapsible>
+    </section>
+  );
+}

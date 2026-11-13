@@ -1,0 +1,39 @@
+import { db } from '@/lib/db'
+import {
+  requireBridgeAuth,
+  jerr,
+  jok,
+  clampPath,
+  makeStagedName,
+} from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * POST /api/bridge/pull — забрать файл с ПК в песочницу.
+ * Body: { path: 'Документы/отчёт.docx' } (относительно папки моста)
+ * Ответ: { transferId, stagedName } — следить через /api/bridge/transfers.
+ * Готовый файл: db/bridge-files/<stagedName> или GET /api/bridge/file/<stagedName>
+ */
+export async function POST(request: Request) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const body = (await request.json().catch(() => ({}))) as { path?: string }
+  const path = clampPath(body.path)
+  if (!path.trim()) return jerr('Не указан путь файла на ПК')
+
+  const stagedName = makeStagedName(path)
+  const transfer = await db.bridgeTransfer.create({
+    data: { direction: 'pc2sb', path, stagedName, status: 'pending' },
+  })
+  await db.bridgeCommand.create({
+    data: {
+      type: 'download_init',
+      payload: JSON.stringify({ transferId: transfer.id, path }),
+      transferId: transfer.id,
+    },
+  })
+
+  return jok({ transferId: transfer.id, stagedName })
+}

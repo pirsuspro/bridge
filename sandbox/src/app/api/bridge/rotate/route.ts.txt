@@ -1,0 +1,15 @@
+import { requireBridgeAuth, jerr, jok, rotateBridgeToken } from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * POST /api/bridge/rotate — сменить токен моста.
+ * После смены нужно перезапустить мост с новым установщиком/конфигом.
+ */
+export async function POST(request: Request) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const newToken = await rotateBridgeToken()
+  return jok({ token: newToken })
+}

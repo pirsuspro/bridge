@@ -1,0 +1,81 @@
+import { db } from '@/lib/db'
+import {
+  requireBridgeAuth,
+  jerr,
+  jok,
+  jappErr,
+  sweep,
+  sleep,
+  clampPath,
+  ACTION_WAIT_MS,
+  TEXT_MAX_CHARS,
+} from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+interface TextPayload {
+  path?: string
+  maxChars?: number
+  content?: string
+  append?: boolean
+}
+
+async function queueAndWait(type: string, payload: TextPayload) {
+  const cmd = await db.bridgeCommand.create({
+    data: { type, payload: JSON.stringify(payload) },
+  })
+  const deadline = Date.now() + ACTION_WAIT_MS
+  let ticks = 0
+  while (Date.now() < deadline) {
+    await sleep(300)
+    ticks++
+    if (ticks % 15 === 0) await sweep()
+    const c = await db.bridgeCommand.findUnique({ where: { id: cmd.id } })
+    if (!c) break
+    if (c.status === 'done') {
+      return jok({
+        data: c.result ? (JSON.parse(c.result) as unknown) : null,
+        commandId: c.id,
+      })
+    }
+    if (c.status === 'failed') {
+      return jappErr(c.error || 'Ошибка выполнения на ПК')
+    }
+  }
+  return jerr('Таймаут ожидания ответа моста (мост офлайн или занят)', 504)
+}
+
+/**
+ * POST /api/bridge/text — быстрые текстовые операции с файлами на ПК.
+ *
+ * op=read:  { path, maxChars? }          -> { content, truncated, sizeBytes, encoding }
+ * op=write: { path, content, append? }   -> { ok, bytes, created }
+ *
+ * Файлы пишутся в UTF-8 без BOM. Только внутри папки моста.
+ */
+export async function POST(request: Request) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const body = (await request.json().catch(() => ({}))) as TextPayload & { op?: string }
+  const op = String(body.op ?? '')
+
+  switch (op) {
+    case 'read': {
+      const path = clampPath(body.path)
+      if (!path.trim()) return jerr('Не указан путь файла')
+      let maxChars = Number(body.maxChars)
+      if (!Number.isFinite(maxChars) || maxChars <= 0) maxChars = 200_000
+      maxChars = Math.min(maxChars, TEXT_MAX_CHARS)
+      return queueAndWait('read_text', { path, maxChars })
+    }
+    case 'write': {
+      const path = clampPath(body.path)
+      if (!path.trim()) return jerr('Не указан путь файла')
+      const content = String(body.content ?? '').slice(0, TEXT_MAX_CHARS)
+      return queueAndWait('write_text', { path, content, append: body.append === true })
+    }
+    default:
+      return jerr(`Неизвестная операция: ${op || '(пусто)'}. Доступны: read, write`)
+  }
+}

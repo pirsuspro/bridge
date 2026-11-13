@@ -1,0 +1,150 @@
+"use client";
+
+// Главная страница — дашборд Z.ai Bridge: статус, файлы, терминал
+// (команды на ПК), фоновые процессы, передачи, журнал.
+//
+// Требования: src/components/bridge/* (12 файлов), хук use-toast,
+// компонент Toaster смонтирован в src/app/layout.tsx.
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { motion } from "framer-motion";
+import { TerminalSquare } from "lucide-react";
+
+import { AgentCheatsheet } from "@/components/bridge/agent-cheatsheet";
+import { fetchBridgeStatus, fetchLog } from "@/components/bridge/api";
+import { BridgeHeader } from "@/components/bridge/header";
+import { ChatCard } from "@/components/bridge/chat-card";
+import { ConnectionCard } from "@/components/bridge/connection-card";
+import { FilesCard } from "@/components/bridge/files-card";
+import { HowItWorks } from "@/components/bridge/how-it-works";
+import { JournalCard } from "@/components/bridge/journal-card";
+import { LogCard } from "@/components/bridge/log-card";
+import { TerminalCard } from "@/components/bridge/terminal-card";
+import { TransfersCard } from "@/components/bridge/transfers-card";
+import type { BridgeStatus, LogEntry } from "@/components/bridge/types";
+
+export default function Home() {
+  const [status, setStatus] = useState<BridgeStatus | null>(null);
+  const [apiDown, setApiDown] = useState(false);
+  const [token, setToken] = useState("");
+  const [logEntries, setLogEntries] = useState<LogEntry[] | null>(null);
+
+  const inFlightRef = useRef(false);
+  const tokenRef = useRef("");
+  const tokenOverrideUntilRef = useRef(0);
+
+  useEffect(() => {
+    tokenRef.current = token;
+  }, [token]);
+
+  const refresh = useCallback(async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    try {
+      const [statusRes, logRes] = await Promise.all([
+        fetchBridgeStatus(),
+        tokenRef.current ? fetchLog(tokenRef.current) : Promise.resolve(null),
+      ]);
+      if (statusRes.ok) {
+        setStatus(statusRes);
+        setApiDown(false);
+        if (statusRes.token && Date.now() > tokenOverrideUntilRef.current) {
+          setToken(statusRes.token);
+        }
+      } else {
+        setApiDown(true);
+      }
+      if (logRes && logRes.ok && logRes.entries) {
+        setLogEntries(logRes.entries);
+      }
+    } finally {
+      inFlightRef.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const id = window.setInterval(() => void refresh(), 5_000);
+    return () => window.clearInterval(id);
+  }, [refresh]);
+
+  const handleTokenRotated = useCallback((newToken: string) => {
+    // 15 секунд игнорируем токен из /status, чтобы гонка со «старым» ответом
+    // не затёрла свежий токен после rotate.
+    tokenOverrideUntilRef.current = Date.now() + 15_000;
+    tokenRef.current = newToken;
+    setToken(newToken);
+    setLogEntries(null);
+  }, []);
+
+  const online = status?.online ?? false;
+
+  return (
+    <div className="flex min-h-screen flex-col bg-zinc-950 text-zinc-100">
+      <BridgeHeader status={status} apiDown={apiDown} sticky />
+
+      <main className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-4 pb-10 pt-6 sm:px-6">
+        <motion.section
+          aria-label="Подключение и файлы"
+          initial={{ opacity: 0, y: 14 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.35 }}
+          className="grid items-stretch gap-6 lg:grid-cols-3"
+        >
+          <ConnectionCard token={token} onTokenRotated={handleTokenRotated} />
+          <div className="min-w-0 lg:col-span-2">
+            <FilesCard token={token} online={online} />
+          </div>
+        </motion.section>
+
+        <motion.section
+          aria-label="Чат с агентом"
+          initial={{ opacity: 0, y: 14 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.35, delay: 0.05 }}
+        >
+          <ChatCard token={token} online={online} />
+        </motion.section>
+
+        <motion.section
+          aria-label="Терминал"
+          initial={{ opacity: 0, y: 14 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.35, delay: 0.1 }}
+        >
+          <TerminalCard token={token} online={online} />
+        </motion.section>
+
+        <motion.section
+          aria-label="Передачи, журнал и память"
+          initial={{ opacity: 0, y: 14 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.35, delay: 0.15 }}
+          className="grid items-stretch gap-6 lg:grid-cols-3"
+        >
+          <TransfersCard token={token} />
+          <LogCard entries={logEntries} />
+          <JournalCard token={token} />
+        </motion.section>
+
+        <motion.div
+          initial={{ opacity: 0, y: 14 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.35, delay: 0.2 }}
+          className="flex flex-col gap-6"
+        >
+          <HowItWorks />
+          <AgentCheatsheet token={token} />
+        </motion.div>
+      </main>
+
+      <footer className="mt-auto border-t border-zinc-800/60 bg-zinc-950 px-4 py-4 text-xs text-zinc-500">
+        <p className="mx-auto flex max-w-6xl flex-wrap items-center justify-center gap-2 text-center">
+          <TerminalSquare className="size-3.5 text-emerald-600" aria-hidden="true" />
+          Z.ai Bridge v2 — файлы и команды напрямую между песочницей и вашим ПК • Остановить мост:
+          закройте окно консоли на ПК
+        </p>
+      </footer>
+    </div>
+  );
+}

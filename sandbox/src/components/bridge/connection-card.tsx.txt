@@ -1,0 +1,279 @@
+"use client";
+
+// Карточка «Подключение»: токен, загрузка файлов настройки,
+// пошаговая инструкция, предупреждение, смена токена.
+
+import { useState } from "react";
+import {
+  Check,
+  Copy,
+  Download,
+  Eye,
+  EyeOff,
+  FileCode2,
+  Loader2,
+  RefreshCcw,
+  TriangleAlert,
+} from "lucide-react";
+
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { useToast } from "@/hooks/use-toast";
+import { downloadWithToken, rotateToken } from "./api";
+import { BTN_GHOST, BTN_OUTLINE, BTN_PRIMARY, CARD_DARK } from "./styles";
+import { copyToClipboard, saveBlob } from "./utils";
+
+const HIDDEN_TOKEN = "••••••••••••••••••••••••";
+
+const STEPS: string[] = [
+  "Скачайте установщик и положите его в отдельную папку, например C:\\zai-bridge",
+  'Запустите zai-bridge-setup.bat двойным кликом (SmartScreen может предупредить — выберите "Подробнее" → "Выполнить в любом случае")',
+  "При первом запуске введите путь к папке на этом ПК, доступ к которой вы даёте песочнице",
+  'Дождитесь статуса "Онлайн" вверху страницы',
+];
+
+interface ConnectionCardProps {
+  token: string;
+  onTokenRotated: (newToken: string) => void;
+}
+
+export function ConnectionCard({ token, onTokenRotated }: ConnectionCardProps) {
+  const { toast } = useToast();
+  const [showToken, setShowToken] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [busy, setBusy] = useState<"installer" | "ps1" | null>(null);
+  const [rotating, setRotating] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  const handleCopy = async () => {
+    if (!token) return;
+    const ok = await copyToClipboard(token);
+    if (ok) {
+      setCopied(true);
+      toast({ title: "Токен скопирован" });
+      window.setTimeout(() => setCopied(false), 2000);
+    } else {
+      toast({
+        title: "Не удалось скопировать",
+        description: "Скопируйте токен вручную, нажав «Показать»",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const handleDownload = async (kind: "installer" | "ps1") => {
+    if (!token || busy) return;
+    setBusy(kind);
+    try {
+      const url =
+        kind === "installer"
+          ? `/api/bridge/setup/installer?origin=${encodeURIComponent(window.location.origin)}`
+          : "/api/bridge/setup/ps1";
+      const res = await downloadWithToken(url, token);
+      if (res.ok) {
+        saveBlob(res.blob, kind === "installer" ? "zai-bridge-setup.bat" : (res.filename ?? "bridge.ps1"));
+        toast({
+          title: kind === "installer" ? "Установщик скачан" : "bridge.ps1 скачан",
+          description: "Следуйте шагам инструкции ниже",
+        });
+      } else {
+        toast({ title: "Не удалось скачать файл", description: res.error, variant: "destructive" });
+      }
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleRotate = async () => {
+    if (!token || rotating) return;
+    setRotating(true);
+    try {
+      const res = await rotateToken(token);
+      if (res.ok && res.token) {
+        onTokenRotated(res.token);
+        toast({
+          title: "Токен обновлён",
+          description: "Скачайте установщик заново и перезапустите мост на ПК",
+        });
+      } else {
+        toast({
+          title: "Не удалось сменить токен",
+          description: res.error ?? "Попробуйте позже",
+          variant: "destructive",
+        });
+      }
+    } finally {
+      setRotating(false);
+      setConfirmOpen(false);
+    }
+  };
+
+  return (
+    <Card className={CARD_DARK}>
+      <CardHeader>
+        <CardTitle className="text-base">Подключение</CardTitle>
+        <CardDescription className="text-zinc-500">
+          Настройка моста на вашем ПК
+        </CardDescription>
+      </CardHeader>
+
+      <CardContent className="flex flex-1 flex-col gap-5">
+        {/* Токен */}
+        <div className="flex flex-col gap-2">
+          <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">
+            Токен моста
+          </span>
+          <div className="flex items-center gap-2">
+            <code
+              className="min-w-0 flex-1 truncate rounded-md border border-zinc-800 bg-zinc-950/70 px-3 py-2.5 font-mono text-xs text-zinc-300"
+              aria-label="Значение токена моста"
+            >
+              {token ? (showToken ? token : HIDDEN_TOKEN) : "Ожидание ответа сервиса…"}
+            </code>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              className="size-10 shrink-0 border-zinc-700 bg-zinc-900/60 hover:bg-zinc-800 hover:text-zinc-100"
+              onClick={() => setShowToken((v) => !v)}
+              disabled={!token}
+              aria-label={showToken ? "Скрыть токен" : "Показать токен"}
+              title={showToken ? "Скрыть токен" : "Показать токен"}
+            >
+              {showToken ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              className="size-10 shrink-0 border-zinc-700 bg-zinc-900/60 hover:bg-zinc-800 hover:text-zinc-100"
+              onClick={() => void handleCopy()}
+              disabled={!token}
+              aria-label="Копировать токен"
+              title="Копировать токен"
+            >
+              {copied ? (
+                <Check className="text-emerald-500" aria-hidden="true" />
+              ) : (
+                <Copy aria-hidden="true" />
+              )}
+            </Button>
+          </div>
+        </div>
+
+        {/* Загрузка файлов настройки */}
+        <div className="flex flex-col gap-2">
+          <Button
+            type="button"
+            className={`${BTN_PRIMARY} flex-1`}
+            onClick={() => void handleDownload("installer")}
+            disabled={!token || busy !== null}
+          >
+            {busy === "installer" ? (
+              <Loader2 className="animate-spin" aria-hidden="true" />
+            ) : (
+              <Download aria-hidden="true" />
+            )}
+            Скачать установщик (.bat)
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            className={`${BTN_OUTLINE} flex-1`}
+            onClick={() => void handleDownload("ps1")}
+            disabled={!token || busy !== null}
+          >
+            {busy === "ps1" ? (
+              <Loader2 className="animate-spin" aria-hidden="true" />
+            ) : (
+              <FileCode2 aria-hidden="true" />
+            )}
+            Скачать bridge.ps1
+          </Button>
+        </div>
+
+        {/* Инструкция */}
+        <div>
+          <h3 className="mb-3 text-sm font-medium text-zinc-300">Как запустить мост</h3>
+          <ol className="flex flex-col gap-3">
+            {STEPS.map((step, index) => (
+              <li key={index} className="flex items-start gap-3">
+                <span
+                  className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full border border-emerald-500/40 bg-emerald-500/10 font-mono text-xs font-semibold text-emerald-400"
+                  aria-hidden="true"
+                >
+                  {index + 1}
+                </span>
+                <span className="text-sm leading-relaxed text-zinc-300">{step}</span>
+              </li>
+            ))}
+          </ol>
+        </div>
+
+        {/* Предупреждение */}
+        <Alert className="border-amber-900/60 bg-amber-950/20 text-amber-200 [&>svg]:text-amber-400">
+          <TriangleAlert aria-hidden="true" />
+          <AlertTitle className="text-amber-200">Не делитесь ссылкой</AlertTitle>
+          <AlertDescription className="text-amber-200/80">
+            Ссылка на эту страницу = доступ к мосту. Не передавайте её третьим лицам.
+          </AlertDescription>
+        </Alert>
+
+        {/* Смена токена */}
+        <Button
+          type="button"
+          variant="ghost"
+          className={`${BTN_GHOST} w-full justify-start`}
+          onClick={() => setConfirmOpen(true)}
+          disabled={!token || rotating}
+        >
+          <RefreshCcw className={rotating ? "animate-spin" : ""} aria-hidden="true" />
+          Повернуть токен
+        </Button>
+      </CardContent>
+
+      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <AlertDialogContent className="border-zinc-800 bg-zinc-900 text-zinc-100">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Повернуть токен?</AlertDialogTitle>
+            <AlertDialogDescription className="text-zinc-400">
+              После смены токена скачайте установщик заново и перезапустите мост. Продолжить?
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="border-zinc-700 bg-transparent text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100">
+              Отмена
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-emerald-500 text-zinc-950 hover:bg-emerald-600"
+              onClick={(event) => {
+                event.preventDefault();
+                void handleRotate();
+              }}
+            >
+              {rotating && <Loader2 className="animate-spin" aria-hidden="true" />}
+              Повернуть
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </Card>
+  );
+}

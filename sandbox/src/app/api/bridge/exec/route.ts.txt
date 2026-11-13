@@ -1,0 +1,78 @@
+import { db } from '@/lib/db'
+import {
+  requireBridgeAuth,
+  jerr,
+  jok,
+  jappErr,
+  sweep,
+  sleep,
+  clampCmd,
+  clampPath,
+  sanitizeEnv,
+  EXEC_MAX_TIMEOUT_SEC,
+} from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * POST /api/bridge/exec — выполнить команду на ПК (синхронно, с ожиданием).
+ * Body: { cmd, cwd?, timeoutSec? (5..600, default 120), env?: {K:V}, waitMs? (сколько ждать ответа роуту) }
+ * Если за waitMs ответ не пришёл — { ok: true, pending: true, commandId } (допросить через GET /api/bridge/command/<id>).
+ */
+export async function POST(request: Request) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const body = (await request.json().catch(() => ({}))) as {
+    cmd?: unknown
+    cwd?: unknown
+    timeoutSec?: unknown
+    env?: unknown
+    waitMs?: unknown
+  }
+
+  const cmd = clampCmd(body.cmd)
+  if (!cmd.trim()) return jerr('Пустая команда')
+
+  let timeoutSec = Number(body.timeoutSec)
+  if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) timeoutSec = 120
+  if (timeoutSec > EXEC_MAX_TIMEOUT_SEC) timeoutSec = EXEC_MAX_TIMEOUT_SEC
+  if (timeoutSec < 5) timeoutSec = 5
+
+  const env = sanitizeEnv(body.env)
+  if (env === null) return jerr('Некорректный env (до 32 пар, ключи до 256, значения до 1024 символов)')
+
+  const cwd = clampPath(body.cwd)
+  const payload = { cmd, cwd, timeoutSec, env }
+
+  const command = await db.bridgeCommand.create({
+    data: { type: 'exec', payload: JSON.stringify(payload) },
+  })
+
+  // Сколько ждём в этом HTTP-запросе: по умолчанию timeoutSec + 30с, но не более 5 минут
+  let waitMs = Number(body.waitMs)
+  if (!Number.isFinite(waitMs) || waitMs <= 0) waitMs = Math.min(timeoutSec * 1000 + 30_000, 300_000)
+  waitMs = Math.max(5_000, Math.min(waitMs, 300_000))
+
+  const deadline = Date.now() + waitMs
+  let ticks = 0
+  while (Date.now() < deadline) {
+    await sleep(350)
+    ticks++
+    if (ticks % 20 === 0) await sweep()
+    const c = await db.bridgeCommand.findUnique({ where: { id: command.id } })
+    if (!c) break
+    if (c.status === 'done') {
+      return jok({
+        data: c.result ? (JSON.parse(c.result) as unknown) : null,
+        commandId: c.id,
+        pending: false,
+      })
+    }
+    if (c.status === 'failed') {
+      return jappErr(c.error || 'Ошибка выполнения на ПК')
+    }
+  }
+  // Время вышло — команда ещё исполняется, отдаём pending
+  return jok({ pending: true, commandId: command.id, timeoutSec })
+}

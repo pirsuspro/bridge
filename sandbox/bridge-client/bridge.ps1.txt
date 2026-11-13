@@ -1,0 +1,1184 @@
+# ============================================================
+#  Z.ai Bridge Agent  v2.3.0
+#  Связывает локальную папку с песочницей Z.ai.
+#  Работает на Windows PowerShell 5.1+ (и pwsh 7+), без зависимостей.
+#
+#  Возможности v2 (сверх v1):
+#   - exec: запуск команд с выводом (stdout/stderr/код возврата)
+#   - фоновые процессы: exec_start / proc_read / proc_write / proc_kill / proc_list
+#   - read_text / write_text: быстрые текстовые правки файлов
+#   - restart: перезапуск агента (подхватится bat-лаунчером)
+#
+#  v2.1.0: постоянный clientId — перезапуск моста больше не вызывает конфликт 409
+#          на сервере; 409 обрабатывается мягко (ожидание, а не ошибка).
+#  v2.2.0: умная кодировка вывода: сырые байты + эвристика (строгий UTF-8,
+#          иначе CP866) — кириллица из cmd, PowerShell и сборщиков читается
+#          корректно; stdin пишется в UTF-8; Python-дети принудительно UTF-8.
+#
+#  v2.3.0: скорость передач (уроки motty — десктопного SSH-клиента:
+#          постоянные соединения, бинарный фрейминг, сжатие):
+#   - чанки ПК<->песочница — сырые байты (application/octet-stream)
+#     вместо base64-in-JSON (−25..33% трафика, без ConvertTo-Json на 1.4 МБ);
+#   - gzip чанков в обе стороны, когда выгодно (текст/код — в 3-5 раз меньше);
+#   - Expect100Continue/Nagle выкл, ConnectionLimit 8 — отклик poll/чанков
+#     без лишних RTT (мелкие POST больше не ждут буферизации Nagle 200 мс);
+#   - обратная совместимость: если сервер старый (нет feats) — автоматический
+#     откат на base64-JSON протокол v2.2.
+#
+#  Запуск: bridge.ps1 -Url <адрес> -Token <токен> [-Folder <путь>]
+#          (параметры и путь к папке сохраняются в bridge_config.json)
+# ============================================================
+
+param(
+    [string]$Url,
+    [string]$Token,
+    [string]$Folder
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$script:BridgeVersion = '2.3.0'
+
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+try { [Console]::InputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+$OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch { }
+
+# v2.3: тюнинг HTTP-стека (постоянные «тёплые» соединения, без лишних RTT)
+try { [Net.ServicePointManager]::Expect100Continue = $false } catch { }
+try { [Net.ServicePointManager]::UseNagleAlgorithm = $false } catch { }
+try { [Net.ServicePointManager]::DefaultConnectionLimit = 8 } catch { }
+try { Add-Type -AssemblyName System.IO.Compression } catch { }
+
+$Sep = [IO.Path]::DirectorySeparatorChar
+$IsWin = ($Sep -eq '\')
+
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ConfigPath = Join-Path $ScriptDir 'bridge_config.json'
+$LogPath = Join-Path $ScriptDir 'bridge.log'
+
+function Write-Log {
+    param([string]$Message)
+    $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message)
+    Write-Host $line
+    try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 } catch { }
+}
+
+# --- Ротация лога ---
+try {
+    if ((Test-Path -LiteralPath $LogPath) -and ((Get-Item -LiteralPath $LogPath).Length -gt 5MB)) {
+        Move-Item -LiteralPath $LogPath -Destination ($LogPath + '.old') -Force
+    }
+} catch { }
+
+# --- Загрузка конфигурации ---
+$cfg = $null
+if (Test-Path -LiteralPath $ConfigPath) {
+    try { $cfg = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $cfg = $null }
+}
+if (-not $Url -and $cfg -and $cfg.url) { $Url = [string]$cfg.url }
+if (-not $Token -and $cfg -and $cfg.token) { $Token = [string]$cfg.token }
+if (-not $Url) {
+    $Url = (Read-Host 'Bridge URL').Trim()
+    if (-not $Url) { Write-Log 'URL не указан. Выход.'; exit 1 }
+}
+$Url = $Url.TrimEnd('/')
+if (-not $Token) {
+    $Token = (Read-Host 'Bridge token').Trim()
+    if (-not $Token) { Write-Log 'Токен не указан. Выход.'; exit 1 }
+}
+
+function Read-FolderFromUser {
+    while ($true) {
+        Write-Host ''
+        Write-Host '  Укажите папку на этом компьютере, к которой песочница получит доступ.'
+        Write-Host ('  Например: C:\Users\' + $env:USERNAME + '\Documents\bridge-share')
+        $raw = Read-Host 'Путь к папке'
+        $candidate = $raw.Trim().Trim('"').Trim()
+        if (-not $candidate) { continue }
+        $full = $null
+        try { $full = [IO.Path]::GetFullPath($candidate) } catch {
+            Write-Host ("  Некорректный путь: " + $candidate); continue
+        }
+        if (Test-Path -LiteralPath $full -PathType Container) { return $full }
+        if (Test-Path -LiteralPath $full) {
+            Write-Host ("  Это файл, а не папка: " + $full); continue
+        }
+        $ans = Read-Host ("  Папка не существует: " + $full + ". Создать? (y - да)")
+        if ($ans -match '^[YyDd]') {
+            try {
+                New-Item -ItemType Directory -Path $full -Force | Out-Null
+                if (Test-Path -LiteralPath $full -PathType Container) { return $full }
+            } catch { Write-Host ("  Не удалось создать: " + $_.Exception.Message) }
+        }
+    }
+}
+
+if (-not $Folder -and $cfg -and $cfg.folder) { $Folder = [string]$cfg.folder }
+if (-not $Folder) { $Folder = Read-FolderFromUser }
+$script:Root = [IO.Path]::GetFullPath($Folder)
+
+# --- Постоянный clientId: переживает перезапуски, чтобы сервер не считал
+#     новый процесс "другим" агентом (иначе 25 сек после рестарта — 409) ---
+$ClientGuid = $null
+if ($cfg -and $cfg.clientId) { $ClientGuid = [string]$cfg.clientId }
+if (-not $ClientGuid -or $ClientGuid -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+    $ClientGuid = [Guid]::NewGuid().ToString()
+}
+
+# --- Сохраняем конфиг (url/token/папку/clientId), чтобы не вводить их заново ---
+try {
+    @{ url = $Url; token = $Token; folder = $script:Root; clientId = $ClientGuid } |
+        ConvertTo-Json | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
+} catch { Write-Log ("Не удалось сохранить конфиг: " + $_.Exception.Message) }
+
+# --- Один экземпляр на машину (mutex) ---
+try {
+    $mutexCreated = $false
+    $mutex = New-Object -TypeName System.Threading.Mutex -ArgumentList $true, 'Global\ZaiBridgeAgent', ([ref]$mutexCreated)
+    if (-not $mutexCreated -and -not $mutex.WaitOne(2000)) {
+        Write-Log 'Другой экземпляр моста уже запущен. Закройте его окно и попробуйте снова.'
+        exit 1
+    }
+} catch {
+    Write-Log 'Не удалось создать mutex (продолжаю без защиты от дублей).'
+}
+
+$Info = @{
+    computer       = $env:COMPUTERNAME
+    user           = $env:USERNAME
+    os             = [Environment]::OSVersion.VersionString
+    psVersion      = $PSVersionTable.PSVersion.ToString()
+    folder         = $script:Root
+    bridgeVersion  = $script:BridgeVersion
+    capabilities   = 'exec,exec_start,proc_read,proc_write,proc_kill,proc_list,read_text,write_text,restart,binchunk,gzip'
+}
+
+$ApiBase = $Url + '/api/bridge'
+$ChunkSize = 1048576
+
+# ============ HTTP-слой (UTF-8, таймауты, повторы) ============
+
+function Get-HttpErrorMessage {
+    param($Record)
+    try {
+        $ex = $Record.Exception
+        if ($ex -and $ex.Response) {
+            $code = ''
+            try { $code = [int]$ex.Response.StatusCode } catch { $code = '' }
+            $bodyText = ''
+            try {
+                $stream = $null
+                try { $stream = $ex.Response.GetResponseStream() } catch { $stream = $null }
+                if ($stream) {
+                    $sr = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+                    $bodyText = $sr.ReadToEnd()
+                }
+            } catch { }
+            if ($bodyText) { return ("HTTP " + $code + " " + $bodyText) }
+            return ("HTTP " + $code)
+        }
+    } catch { }
+    return $Record.Exception.Message
+}
+
+function Invoke-ApiOnce {
+    param([string]$Method, [string]$Path, $BodyObj, [byte[]]$BodyBytes, [string]$ContentType = 'application/octet-stream', [int]$TimeoutSec = 60)
+    $uri = $ApiBase + $Path
+    $splat = @{
+        Uri            = $uri
+        Method         = $Method
+        Headers        = @{ 'x-bridge-token' = $Token }
+        TimeoutSec     = $TimeoutSec
+        UseBasicParsing = $true
+    }
+    if ($null -ne $BodyBytes) {
+        # v2.3: бинарное тело (чанк файла, возможно gzip)
+        $splat.Body = $BodyBytes
+        $splat.ContentType = $ContentType
+    } elseif ($null -ne $BodyObj) {
+        $json = ConvertTo-Json -InputObject $BodyObj -Depth 10 -Compress
+        $splat.Body = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $splat.ContentType = 'application/json; charset=utf-8'
+    }
+    $resp = Invoke-WebRequest @splat
+    $text = ''
+    try {
+        if ($resp.RawContentStream) {
+            $resp.RawContentStream.Position = 0
+            $sr = New-Object System.IO.StreamReader($resp.RawContentStream, [System.Text.Encoding]::UTF8)
+            $text = $sr.ReadToEnd()
+            $sr.Close()
+        }
+    } catch { $text = '' }
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    return ($text | ConvertFrom-Json)
+}
+
+# v2.3: бинарный GET (чанк файла): сырой ответ + заголовки x-index/x-last/x-eof/x-gz
+function Invoke-ApiRawResponse {
+    param([string]$Method, [string]$Path, [int]$Retries = 4, [int]$TimeoutSec = 60)
+    $attempt = 0
+    while ($true) {
+        try {
+            $uri = $ApiBase + $Path
+            return Invoke-WebRequest -Uri $uri -Method $Method `
+                -Headers @{ 'x-bridge-token' = $Token } `
+                -TimeoutSec $TimeoutSec -UseBasicParsing
+        } catch {
+            $attempt++
+            $msg = Get-HttpErrorMessage -Record $_
+            if ($attempt -gt $Retries) { throw ("Сетевая ошибка (" + $Path + "): " + $msg) }
+            if ($msg -like 'HTTP 4*' -and $msg -notlike 'HTTP 429*') {
+                throw ("Ошибка API (" + $Path + "): " + $msg)
+            }
+            Start-Sleep -Milliseconds (400 * $attempt)
+        }
+    }
+}
+
+# v2.3: заголовок ответа без учёта регистра (PS 5.1 Headers — регистрозависим)
+function Get-RespHeader {
+    param($Response, [string]$Name)
+    if ($null -eq $Response -or $null -eq $Response.Headers) { return '' }
+    foreach ($k in @($Response.Headers.Keys)) {
+        if ([string]::Compare([string]$k, $Name, $true) -eq 0) {
+            return [string]$Response.Headers[$k]
+        }
+    }
+    return ''
+}
+
+# v2.3: gzip-сжатие байтов (чанк ПК -> песочница)
+function Compress-Bytes {
+    param([byte[]]$Data)
+    $ms = New-Object System.IO.MemoryStream
+    $gz = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionLevel]::Fastest, $true)
+    $gz.Write($Data, 0, $Data.Length)
+    $gz.Close()
+    $out = $ms.ToArray()
+    $ms.Close()
+    return $out
+}
+
+# v2.3: gzip-распаковка байтов (чанк песочница -> ПК)
+function Expand-Bytes {
+    param([byte[]]$Data)
+    $in = New-Object System.IO.MemoryStream(, $Data)
+    $gz = New-Object System.IO.Compression.GZipStream($in, [System.IO.Compression.CompressionMode]::Decompress)
+    $out = New-Object System.IO.MemoryStream
+    $gz.CopyTo($out)
+    $gz.Close()
+    $in.Close()
+    $bytes = $out.ToArray()
+    $out.Close()
+    return $bytes
+}
+
+function Invoke-Api {
+    param([string]$Method, [string]$Path, $BodyObj, [byte[]]$BodyBytes, [string]$ContentType = 'application/octet-stream', [int]$Retries = 4, [int]$TimeoutSec = 60)
+    $attempt = 0
+    while ($true) {
+        try {
+            return Invoke-ApiOnce -Method $Method -Path $Path -BodyObj $BodyObj -BodyBytes $BodyBytes -ContentType $ContentType -TimeoutSec $TimeoutSec
+        } catch {
+            $attempt++
+            $msg = Get-HttpErrorMessage -Record $_
+            if ($attempt -gt $Retries) { throw ("Сетевая ошибка (" + $Path + "): " + $msg) }
+            if ($msg -like 'HTTP 4*' -and $msg -notlike 'HTTP 429*') {
+                throw ("Ошибка API (" + $Path + "): " + $msg)
+            }
+            Start-Sleep -Milliseconds (400 * $attempt)
+        }
+    }
+}
+
+function Send-Result {
+    param([string]$Id, [bool]$Ok, $Data, [string]$ErrorMessage)
+    $body = @{ id = $Id; ok = $Ok }
+    if ($Ok) {
+        if ($null -ne $Data) { $body.data = $Data }
+    } else {
+        $body.error = $ErrorMessage
+    }
+    Invoke-Api -Method 'Post' -Path '/result' -BodyObj $body -Retries 6 | Out-Null
+}
+
+function Fail-Transfer {
+    param([string]$TransferId, [string]$Message)
+    try {
+        Invoke-Api -Method 'Post' -Path ("/transfer/" + $TransferId + "/fail") -BodyObj @{ error = $Message } -Retries 2 -TimeoutSec 30 | Out-Null
+    } catch { }
+}
+
+# ============ Безопасные пути (только внутри выбранной папки) ============
+
+function Resolve-BridgePath {
+    param([string]$RelPath)
+    if ($null -eq $RelPath) { $RelPath = '' }
+    $RelPath = ([string]$RelPath).Trim().TrimStart('\', '/')
+    if ($RelPath -eq '') { return $script:Root }
+    $parts = @($RelPath -split '[\\/]' | Where-Object { $_ -ne '' -and $_ -ne '.' })
+    if ($parts -contains '..') { throw ("Путь не должен содержать '..': " + $RelPath) }
+    $cur = $script:Root
+    foreach ($p in $parts) { $cur = [IO.Path]::Combine($cur, $p) }
+    $full = [IO.Path]::GetFullPath($cur)
+    $rootFull = [IO.Path]::GetFullPath($script:Root)
+    $rootPrefix = $rootFull.TrimEnd($Sep) + $Sep
+    $cmpType = if ($IsWin) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    if (-not $full.StartsWith($rootPrefix, $cmpType) -and $full -ne $rootFull.TrimEnd($Sep)) {
+        throw ("Путь вне папки моста: " + $RelPath)
+    }
+    return $full
+}
+
+function Get-RelPath {
+    param([string]$FullPath)
+    $rootFull = [IO.Path]::GetFullPath($script:Root)
+    $rootPrefix = $rootFull.TrimEnd($Sep) + $Sep
+    $rel = $FullPath.Substring($rootPrefix.Length)
+    return ($rel -replace '\\', '/')
+}
+
+# ============ v2: движок процессов (C#, потокобезопасно) ============
+
+$script:ExecAvailable = $false
+try {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Text;
+using System.Threading;
+
+namespace ZaiBridge
+{
+    public class ProcEntry
+    {
+        public string Handle;
+        public Process Proc;
+        public int Pid;
+        public string Cmd;
+        public string Cwd;
+        public DateTime StartedAt;
+        public long DurationMs;
+        public int ExitCode;
+        public bool ExitKnown;
+        public bool TimedOut;
+        public bool Killed;
+        public StringBuilder Out = new StringBuilder(65536);
+        public StringBuilder Err = new StringBuilder(4096);
+        public object Gate = new object();
+    }
+
+    public static class ProcMan
+    {
+        private static readonly Dictionary<string, ProcEntry> Procs = new Dictionary<string, ProcEntry>();
+        private static readonly object LockObj = new object();
+        private static long _seq = 0;
+
+        private static ProcEntry Get(string handle)
+        {
+            lock (LockObj)
+            {
+                ProcEntry entry;
+                if (!Procs.TryGetValue(handle, out entry))
+                {
+                    throw new Exception("process not found: " + handle);
+                }
+                return entry;
+            }
+        }
+
+        // Latin-1 (28591): каждый байт дочернего процесса ложится в char 1:1,
+        // настоящая кодировка определяется при чтении (ReadDecoded).
+        private static readonly Encoding RawEnc = Encoding.GetEncoding(28591);
+        private static readonly UTF8Encoding StrictUtf8 = new UTF8Encoding(false, true);
+
+        public static string Start(string cmd, string cwd, Dictionary<string,string> env)
+        {
+            ProcessStartInfo psi = new ProcessStartInfo();
+            psi.FileName = "cmd.exe";
+            psi.Arguments = "/d /c chcp 65001>nul & " + cmd;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.RedirectStandardInput = true;
+            psi.StandardOutputEncoding = RawEnc;
+            psi.StandardErrorEncoding = RawEnc;
+            if (!String.IsNullOrEmpty(cwd)) { psi.WorkingDirectory = cwd; }
+            // Подталкиваем Python-инструменты к UTF-8 (остальным не мешает)
+            psi.EnvironmentVariables["PYTHONUTF8"] = "1";
+            psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+            if (env != null)
+            {
+                foreach (KeyValuePair<string,string> kv in env)
+                {
+                    psi.EnvironmentVariables[kv.Key] = kv.Value;
+                }
+            }
+            Process p = new Process();
+            p.StartInfo = psi;
+            p.EnableRaisingEvents = true;
+            ProcEntry entry = new ProcEntry();
+            entry.Cmd = cmd;
+            entry.Cwd = (cwd == null ? "" : cwd);
+            entry.Handle = "p" + Interlocked.Increment(ref _seq).ToString("x");
+            entry.StartedAt = DateTime.Now;
+            p.OutputDataReceived += delegate(object s, DataReceivedEventArgs ev)
+            {
+                if (ev.Data != null) { lock (entry.Gate) { entry.Out.AppendLine(ev.Data); } }
+            };
+            p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs ev)
+            {
+                if (ev.Data != null) { lock (entry.Gate) { entry.Err.AppendLine(ev.Data); } }
+            };
+            p.Start();
+            entry.Proc = p;
+            entry.Pid = p.Id;
+            p.BeginOutputReadLine();
+            p.BeginErrorReadLine();
+            lock (LockObj) { Procs[entry.Handle] = entry; }
+            return entry.Handle;
+        }
+
+        public static bool HasExited(string handle)
+        {
+            ProcEntry entry = Get(handle);
+            lock (LockObj)
+            {
+                if (entry.ExitKnown) { return true; }
+                if (entry.Proc.HasExited)
+                {
+                    entry.ExitKnown = true;
+                    try { entry.ExitCode = entry.Proc.ExitCode; }
+                    catch (Exception) { entry.ExitCode = -1; }
+                    entry.DurationMs = (long)(DateTime.Now - entry.StartedAt).TotalMilliseconds;
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        public static int GetPid(string handle) { return Get(handle).Pid; }
+        public static string GetCmd(string handle) { return Get(handle).Cmd; }
+        public static long GetDurationMs(string handle) { return Get(handle).DurationMs; }
+        public static int GetExitCode(string handle) { return Get(handle).ExitCode; }
+        public static bool IsTimedOut(string handle) { return Get(handle).TimedOut; }
+
+        public static DateTime GetStartedAt(string handle) { return Get(handle).StartedAt; }
+
+        public static void SetTimedOut(string handle)
+        {
+            lock (LockObj) { Get(handle).TimedOut = true; }
+        }
+
+        public static string Read(string handle, int stream, int from, int maxChars, out int next)
+        {
+            ProcEntry entry = Get(handle);
+            StringBuilder sb = (stream == 0 ? entry.Out : entry.Err);
+            lock (entry.Gate)
+            {
+                if (from < 0) { from = 0; }
+                if (from > sb.Length) { from = sb.Length; }
+                int len = sb.Length - from;
+                if (len > maxChars) { len = maxChars; }
+                next = from + len;
+                return sb.ToString(from, len);
+            }
+        }
+
+        // Эвристика кодировки вывода. Windows-утилиты пишут в pipe по-разному:
+        // cmd.exe — CP866 (системная OEM), PowerShell/Python/сборщики — UTF-8.
+        // Шаг 1: весь чанк валиден как UTF-8 — это он и есть.
+        // Шаг 2: построчно (cmd-эхо вперемешку с UTF-8-выводом инструментов).
+        public static string ReadDecoded(string handle, int stream, int from, int maxChars, out int next, out string encName)
+        {
+            string raw = Read(handle, stream, from, maxChars, out next);
+            if (raw.Length == 0) { encName = ""; return ""; }
+            byte[] bytes = new byte[raw.Length];
+            for (int i = 0; i < raw.Length; i++) { bytes[i] = (byte)raw[i]; }
+            try
+            {
+                string whole = StrictUtf8.GetString(bytes);
+                encName = "utf-8";
+                return whole;
+            }
+            catch (Exception) { }
+            string[] lines = raw.Split('\n');
+            StringBuilder sb2 = new StringBuilder(raw.Length + 16);
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string ln = lines[i];
+                if (ln.Length > 0 && ln[ln.Length - 1] == '\r') { ln = ln.Substring(0, ln.Length - 1); }
+                byte[] lb = new byte[ln.Length];
+                for (int j = 0; j < ln.Length; j++) { lb[j] = (byte)ln[j]; }
+                try { sb2.Append(StrictUtf8.GetString(lb)); }
+                catch (Exception) { sb2.Append(Encoding.GetEncoding(866).GetString(lb)); }
+                if (i < lines.Length - 1) { sb2.Append("\r\n"); }
+            }
+            encName = "mixed:cp866/utf-8";
+            return sb2.ToString();
+        }
+
+        public static void WriteStdin(string handle, string text, bool newLine)
+        {
+            ProcEntry entry = Get(handle);
+            if (!entry.Proc.StartInfo.RedirectStandardInput)
+            {
+                throw new Exception("stdin is not redirected for this process");
+            }
+            byte[] bytes = Encoding.UTF8.GetBytes(newLine ? text + "\r\n" : text);
+            entry.Proc.StandardInput.BaseStream.Write(bytes, 0, bytes.Length);
+            entry.Proc.StandardInput.BaseStream.Flush();
+        }
+
+        public static void Kill(string handle)
+        {
+            ProcEntry entry = Get(handle);
+            lock (LockObj)
+            {
+                entry.Killed = true;
+                try
+                {
+                    ProcessStartInfo psi = new ProcessStartInfo("taskkill", "/PID " + entry.Pid + " /T /F");
+                    psi.UseShellExecute = false;
+                    psi.CreateNoWindow = true;
+                    Process tk = Process.Start(psi);
+                    if (tk != null && !tk.WaitForExit(8000)) { tk.Kill(); }
+                }
+                catch (Exception) { }
+                try { if (!entry.Proc.HasExited) { entry.Proc.Kill(); } }
+                catch (Exception) { }
+            }
+        }
+
+        public static string[] Handles()
+        {
+            lock (LockObj)
+            {
+                string[] arr = new string[Procs.Keys.Count];
+                Procs.Keys.CopyTo(arr, 0);
+                return arr;
+            }
+        }
+    }
+}
+"@
+    $script:ExecAvailable = $true
+} catch {
+    Write-Log ("ВНИМАНИЕ: exec-движок не скомпилировался — файловые команды работают, exec нет. Причина: " + $_.Exception.Message)
+}
+
+# ============ v2: защита от катастрофических команд ============
+
+$DenyPatterns = @(
+    '\bformat\s+[a-z]:',
+    '\bshutdown\b',
+    '\bdiskpart\b',
+    '\bmkfs\.',
+    '\bbcdedit\b',
+    'vssadmin\s+delete'
+)
+
+function Test-Denied {
+    param([string]$CmdText)
+    foreach ($p in $DenyPatterns) {
+        if ($CmdText -match $p) { return $true }
+    }
+    return $false
+}
+
+# ============ v2: обработчики запуска команд ============
+
+function ConvertTo-EnvDictionary {
+    param($EnvObj)
+    if ($null -eq $EnvObj) { return $null }
+    $d = New-Object 'System.Collections.Generic.Dictionary[string,string]'
+    foreach ($p in $EnvObj.PSObject.Properties) {
+        $d.Add([string]$p.Name, [string]$p.Value)
+    }
+    return $d
+}
+
+function Resolve-ExecCwd {
+    param([string]$CwdPath)
+    if ([string]::IsNullOrWhiteSpace($CwdPath)) { return $script:Root }
+    return Resolve-BridgePath $CwdPath
+}
+
+function Start-ExecTask {
+    param($cmd, $payload)
+    if (-not $script:ExecAvailable) { throw 'exec-движок недоступен (ошибка компиляции при старте моста)' }
+    $cmdText = [string]$payload.cmd
+    if ([string]::IsNullOrWhiteSpace($cmdText)) { throw 'пустая команда' }
+    if (Test-Denied $cmdText) { throw ('команда отклонена защитным фильтром: ' + $cmdText) }
+    $cwd = Resolve-ExecCwd ([string]$payload.cwd)
+    if (-not (Test-Path -LiteralPath $cwd -PathType Container)) { throw ('рабочая папка не найдена: ' + $cwd) }
+    $timeoutSec = [double]0
+    if ($payload.timeoutSec) { $timeoutSec = [double]$payload.timeoutSec }
+    if ($timeoutSec -lt 5) { $timeoutSec = 120 }
+    if ($timeoutSec -gt 600) { $timeoutSec = 600 }
+    $envDict = ConvertTo-EnvDictionary $payload.env
+    $handle = [ZaiBridge.ProcMan]::Start($cmdText, $cwd, $envDict)
+    $task = @{
+        handle   = $handle
+        deadline = (Get-Date).AddSeconds($timeoutSec + 3)
+    }
+    $Global:BridgeTasks[[string]$cmd.id] = $task
+    Write-Log ("exec [" + $cmd.id + "] запущен (" + $timeoutSec + "с): " + $cmdText)
+    return $null
+}
+
+function Update-ExecTasks {
+    if ($Global:BridgeTasks.Count -eq 0) { return }
+    $doneIds = @()
+    foreach ($kv in @($Global:BridgeTasks.GetEnumerator())) {
+        $id = [string]$kv.Key
+        $task = $kv.Value
+        $handle = [string]$task.handle
+        try {
+            $exited = [ZaiBridge.ProcMan]::HasExited($handle)
+            if (-not $exited -and ((Get-Date) -gt $task.deadline)) {
+                Write-Log ("exec [" + $id + "] таймаут — убиваю дерево процессов")
+                [ZaiBridge.ProcMan]::Kill($handle)
+                [ZaiBridge.ProcMan]::SetTimedOut($handle)
+                Start-Sleep -Milliseconds 600
+                $exited = [ZaiBridge.ProcMan]::HasExited($handle)
+                if (-not $exited) { continue }
+            }
+            if ($exited) {
+                $nextOut = 0
+                $nextErr = 0
+                $outEnc = ''
+                $errEnc = ''
+                $out = [ZaiBridge.ProcMan]::ReadDecoded($handle, 0, 0, 400000, [ref]$nextOut, [ref]$outEnc)
+                $err = [ZaiBridge.ProcMan]::ReadDecoded($handle, 1, 0, 400000, [ref]$nextErr, [ref]$errEnc)
+                $code = [ZaiBridge.ProcMan]::GetExitCode($handle)
+                $dur = [ZaiBridge.ProcMan]::GetDurationMs($handle)
+                $timedOut = [bool][ZaiBridge.ProcMan]::IsTimedOut($handle)
+                $data = @{
+                    code         = $code
+                    stdout       = $out
+                    stderr       = $err
+                    stdoutEnc    = $outEnc
+                    stderrEnc    = $errEnc
+                    stdoutTrunc  = ($out.Length -ge 400000)
+                    stderrTrunc  = ($err.Length -ge 400000)
+                    durationMs   = $dur
+                    timedOut     = $timedOut
+                }
+                Send-Result -Id $id -Ok $true -Data $data
+                Write-Log ("exec [" + $id + "] завершён, код " + $code + ", " + $dur + " мс")
+                $doneIds += $id
+            }
+        } catch {
+            $msg = $_.Exception.Message
+            Write-Log ("Ошибка задачи exec [" + $id + "]: " + $msg)
+            try { Send-Result -Id $id -Ok $false -ErrorMessage $msg } catch { }
+            $doneIds += $id
+        }
+    }
+    foreach ($id in @($doneIds)) { $Global:BridgeTasks.Remove($id) }
+}
+
+function Start-BackgroundProc {
+    param($payload)
+    if (-not $script:ExecAvailable) { throw 'exec-движок недоступен (ошибка компиляции при старте моста)' }
+    $cmdText = [string]$payload.cmd
+    if ([string]::IsNullOrWhiteSpace($cmdText)) { throw 'пустая команда' }
+    if (Test-Denied $cmdText) { throw ('команда отклонена защитным фильтром: ' + $cmdText) }
+    $cwd = Resolve-ExecCwd ([string]$payload.cwd)
+    if (-not (Test-Path -LiteralPath $cwd -PathType Container)) { throw ('рабочая папка не найдена: ' + $cwd) }
+    $envDict = ConvertTo-EnvDictionary $payload.env
+    $handle = [ZaiBridge.ProcMan]::Start($cmdText, $cwd, $envDict)
+    $procPid = [ZaiBridge.ProcMan]::GetPid($handle)
+    Write-Log ("фон " + $handle + " (pid " + $procPid + "): " + $cmdText)
+    return @{ handle = $handle; pid = $procPid; cmd = $cmdText }
+}
+
+function Read-BackgroundProc {
+    param($payload)
+    $handle = [string]$payload.handle
+    if (-not $handle) { throw 'не указан handle процесса' }
+    $fromOut = 0
+    if ($payload.fromOut) { $fromOut = [int]$payload.fromOut }
+    $fromErr = 0
+    if ($payload.fromErr) { $fromErr = [int]$payload.fromErr }
+    $maxChars = 100000
+    if ($payload.maxChars) { $maxChars = [int]$payload.maxChars }
+    $nextOut = 0
+    $nextErr = 0
+    $outEnc = ''
+    $errEnc = ''
+    $out = [ZaiBridge.ProcMan]::ReadDecoded($handle, 0, $fromOut, $maxChars, [ref]$nextOut, [ref]$outEnc)
+    $err = [ZaiBridge.ProcMan]::ReadDecoded($handle, 1, $fromErr, $maxChars, [ref]$nextErr, [ref]$errEnc)
+    $running = -not [ZaiBridge.ProcMan]::HasExited($handle)
+    $res = @{
+        handle   = $handle
+        pid      = [ZaiBridge.ProcMan]::GetPid($handle)
+        running  = $running
+        stdout   = $out
+        stderr   = $err
+        stdoutEnc = $outEnc
+        stderrEnc = $errEnc
+        nextOut  = $nextOut
+        nextErr  = $nextErr
+    }
+    if (-not $running) {
+        $res.exitCode = [ZaiBridge.ProcMan]::GetExitCode($handle)
+        $res.durationMs = [ZaiBridge.ProcMan]::GetDurationMs($handle)
+    }
+    return $res
+}
+
+function Write-BackgroundProc {
+    param($payload)
+    $handle = [string]$payload.handle
+    if (-not $handle) { throw 'не указан handle процесса' }
+    $inputText = [string]$payload.input
+    $newLine = $true
+    if ($payload.newline -eq $false) { $newLine = $false }
+    if ([ZaiBridge.ProcMan]::HasExited($handle)) { throw 'процесс уже завершён' }
+    [ZaiBridge.ProcMan]::WriteStdin($handle, $inputText, $newLine)
+    return @{ ok = $true }
+}
+
+function Kill-BackgroundProc {
+    param($payload)
+    $handle = [string]$payload.handle
+    if (-not $handle) { throw 'не указан handle процесса' }
+    $already = $false
+    try {
+        if ([ZaiBridge.ProcMan]::HasExited($handle)) { $already = $true }
+    } catch { }
+    if (-not $already) { [ZaiBridge.ProcMan]::Kill($handle) }
+    Write-Log ("kill " + $handle + " (уже завершён: " + $already + ")")
+    return @{ ok = $true; alreadyFinished = $already }
+}
+
+function List-BackgroundProcs {
+    if (-not $script:ExecAvailable) { throw 'exec-движок недоступен' }
+    $handles = [ZaiBridge.ProcMan]::Handles()
+    $arr = @()
+    foreach ($h in $handles) {
+        $running = -not [ZaiBridge.ProcMan]::HasExited($h)
+        $entry = @{
+            handle    = $h
+            pid       = [ZaiBridge.ProcMan]::GetPid($h)
+            cmd       = [ZaiBridge.ProcMan]::GetCmd($h)
+            startedAt = ([ZaiBridge.ProcMan]::GetStartedAt($h)).ToString('yyyy-MM-dd HH:mm:ss')
+            running   = $running
+        }
+        if (-not $running) {
+            $entry.exitCode = [ZaiBridge.ProcMan]::GetExitCode($h)
+            $entry.durationMs = [ZaiBridge.ProcMan]::GetDurationMs($h)
+        }
+        $arr += ,$entry
+    }
+    return @{ procs = $arr }
+}
+
+function Read-TextFile {
+    param($payload)
+    $p = Resolve-BridgePath $payload.path
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw ('Файл не найден: ' + $payload.path) }
+    $size = (Get-Item -LiteralPath $p).Length
+    if ($size -gt 2000000) { throw ('Файл больше 2 МБ (' + $size + ' байт) — используйте обычную передачу файлов') }
+    $bytes = [IO.File]::ReadAllBytes($p)
+    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    $content = $null
+    $encName = 'utf-8'
+    try {
+        $content = $strictUtf8.GetString($bytes)
+    } catch {
+        $encName = 'cp1251'
+        $content = [System.Text.Encoding]::GetEncoding(1251).GetString($bytes)
+    }
+    if ($content.Length -gt 0 -and $content[0] -eq [char]0xFEFF) { $content = $content.Substring(1) }
+    $maxChars = 200000
+    if ($payload.maxChars) { $maxChars = [int]$payload.maxChars }
+    $truncated = $false
+    if ($content.Length -gt $maxChars) {
+        $content = $content.Substring(0, $maxChars)
+        $truncated = $true
+    }
+    return @{ content = $content; truncated = $truncated; sizeBytes = $size; encoding = $encName; path = [string]$payload.path }
+}
+
+function Write-TextFileCmd {
+    param($payload)
+    $p = Resolve-BridgePath $payload.path
+    $content = [string]$payload.content
+    $append = $false
+    if ($payload.append -eq $true) { $append = $true }
+    $dir = Split-Path -Parent $p
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $existed = Test-Path -LiteralPath $p
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    if ($append) {
+        [IO.File]::AppendAllText($p, $content, $utf8)
+    } else {
+        [IO.File]::WriteAllText($p, $content, $utf8)
+    }
+    $modeWord = 'записан'
+    if ($append) { $modeWord = 'дополнен' }
+    Write-Log ("Текст " + $modeWord + ": " + $payload.path + " (" + $content.Length + " симв)")
+    return @{ ok = $true; bytes = ([Text.Encoding]::UTF8.GetByteCount($content)); created = (-not $existed); appended = $append }
+}
+
+function Invoke-Restart {
+    param($cmd)
+    Write-Log 'Команда restart: отвечаю и перезапускаюсь через 2 секунды.'
+    try {
+        Send-Result -Id $cmd.id -Ok $true -Data @{ ok = $true; restarting = $true }
+    } catch { }
+    $killer = 'Start-Sleep -Seconds 2; Stop-Process -Id ' + $PID + ' -Force'
+    Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $killer) -WindowStyle Hidden
+    return $null
+}
+
+# ============ Обработчики файловых команд (v1) ============
+
+function Invoke-Stat {
+    param($payload)
+    $p = Resolve-BridgePath $payload.path
+    if (-not (Test-Path -LiteralPath $p)) { return @{ exists = $false } }
+    $item = Get-Item -LiteralPath $p -Force
+    $isDir = [bool]$item.PSIsContainer
+    return @{
+        exists = $true
+        isDir  = $isDir
+        size   = if ($isDir) { 0 } else { [int64]$item.Length }
+        mtime  = $item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+    }
+}
+
+function Get-Listing {
+    param($payload)
+    $dir = Resolve-BridgePath $payload.path
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+        throw ("Папка не найдена: " + $payload.path)
+    }
+    $limit = 2000
+    if ($payload.recursive) {
+        $items = @(Get-ChildItem -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue)
+    } else {
+        $items = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue |
+            Sort-Object @{ Expression = { -not [bool]$_.PSIsContainer } }, Name)
+    }
+    $entries = @()
+    $truncated = $false
+    foreach ($i in $items) {
+        if ($entries.Count -ge $limit) { $truncated = $true; break }
+        $isDir = [bool]$i.PSIsContainer
+        $entries += ,@{
+            name  = $i.Name
+            path  = (Get-RelPath $i.FullName)
+            isDir = $isDir
+            size  = if ($isDir) { 0 } else { [int64]$i.Length }
+            mtime = $i.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+        }
+    }
+    return @{ path = [string]$payload.path; entries = $entries; truncated = $truncated }
+}
+
+function New-Dir {
+    param($payload)
+    $p = Resolve-BridgePath $payload.path
+    if (-not (Test-Path -LiteralPath $p -PathType Container)) {
+        New-Item -ItemType Directory -Path $p -Force | Out-Null
+    }
+    return @{ ok = $true; path = (Get-RelPath $p) }
+}
+
+function Remove-BridgeItem {
+    param($payload)
+    $p = Resolve-BridgePath $payload.path
+    $rootFull = [IO.Path]::GetFullPath($script:Root).TrimEnd($Sep)
+    if ($p.TrimEnd($Sep) -eq $rootFull) { throw 'Нельзя удалить корневую папку моста' }
+    if (-not (Test-Path -LiteralPath $p)) { return @{ ok = $true; note = 'уже удалено' } }
+    Remove-Item -LiteralPath $p -Recurse -Force
+    return @{ ok = $true }
+}
+
+function Move-BridgeItem {
+    param($payload)
+    $from = Resolve-BridgePath $payload.from
+    $to = Resolve-BridgePath $payload.to
+    if (-not (Test-Path -LiteralPath $from)) { throw ("Не найдено: " + $payload.from) }
+    if (Test-Path -LiteralPath $to -PathType Container) {
+        throw ("Папка с таким именем уже существует: " + $payload.to)
+    }
+    $parent = Split-Path -Parent $to
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    if (Test-Path -LiteralPath $to -PathType Leaf) { Remove-Item -LiteralPath $to -Force }
+    Move-Item -LiteralPath $from -Destination $to -Force
+    return @{ ok = $true }
+}
+
+# --- Передача файла: ПК -> песочница ---
+function Invoke-DownloadTransfer {
+    param($cmd, $payload)
+    $tid = [string]$payload.transferId
+    $p = Resolve-BridgePath $payload.path
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
+        $msg = "Файл не найден: $($payload.path)"
+        Send-Result -Id $cmd.id -Ok $false -ErrorMessage $msg
+        return $null
+    }
+    $item = Get-Item -LiteralPath $p
+    $size = [int64]$item.Length
+    if ($size -gt 2000000000) {
+        $msg = 'Файл больше 2 ГБ — не поддерживается'
+        Send-Result -Id $cmd.id -Ok $false -ErrorMessage $msg
+        return $null
+    }
+    $hash = ''
+    try { $hash = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLower() } catch { $hash = '' }
+
+    # Сначала результат команды (размер и хэш), затем чанки
+    Send-Result -Id $cmd.id -Ok $true -Data @{ ok = $true; size = $size; sha256 = $hash }
+
+    $fs = $null
+    try {
+        $fs = [IO.File]::OpenRead($p)
+        $buf = New-Object byte[] $ChunkSize
+        $index = 0
+        $binOk = ($Global:ServerFeats -contains 'binchunk')
+        $gzOk = ($Global:ServerFeats -contains 'gzip')
+        while ($true) {
+            $n = $fs.Read($buf, 0, $ChunkSize)
+            if ($n -le 0) { break }
+            if ($n -eq $ChunkSize) {
+                $chunk = $buf
+            } else {
+                $chunk = New-Object byte[] $n
+                [Array]::Copy($buf, $chunk, $n)
+            }
+            if ($binOk) {
+                # v2.3: сырые байты (+gzip, если выгодно) вместо base64-JSON
+                $chunkPayload = $chunk
+                $useGz = $false
+                if ($gzOk -and $chunk.Length -gt 512) {
+                    try {
+                        $packed = Compress-Bytes -Data $chunk
+                        if ($packed.Length -lt $chunk.Length) {
+                            $chunkPayload = $packed
+                            $useGz = $true
+                        }
+                    } catch { $chunkPayload = $chunk; $useGz = $false }
+                }
+                $q = "/transfer/$tid/chunk?index=$index"
+                if ($useGz) { $q = $q + '&gz=1' }
+                Invoke-Api -Method 'Post' -Path $q -BodyBytes $chunkPayload -ContentType 'application/octet-stream' -Retries 6 -TimeoutSec 180 | Out-Null
+            } else {
+                $b64 = [Convert]::ToBase64String($chunk)
+                Invoke-Api -Method 'Post' -Path ("/transfer/$tid/chunk") -BodyObj @{ index = $index; dataB64 = $b64 } -Retries 6 -TimeoutSec 120 | Out-Null
+            }
+            $Global:BridgeLastHeartbeat = Get-Date
+            $index++
+        }
+        Invoke-Api -Method 'Post' -Path ("/transfer/$tid/complete") -BodyObj @{ sha256 = $hash } -Retries 6 -TimeoutSec 60 | Out-Null
+        Write-Log ("Отправлен файл: " + $payload.path + " (" + $size + " байт)")
+    } catch {
+        $msg = $_.Exception.Message
+        Fail-Transfer -TransferId $tid -Message $msg
+        Write-Log ("Ошибка отправки файла " + $payload.path + ": " + $msg)
+    } finally {
+        if ($fs) { $fs.Dispose() }
+    }
+    return $null
+}
+
+# --- Передача файла: песочница -> ПК ---
+function Invoke-UploadTransfer {
+    param($cmd, $payload)
+    $tid = [string]$payload.transferId
+    $dest = Resolve-BridgePath $payload.path
+    if (Test-Path -LiteralPath $dest -PathType Container) {
+        $msg = "Папка с таким именем уже существует: $($payload.path)"
+        Send-Result -Id $cmd.id -Ok $false -ErrorMessage $msg
+        return $null
+    }
+    $parent = Split-Path -Parent $dest
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    $tmp = $dest + '.bridgepart'
+
+    Send-Result -Id $cmd.id -Ok $true -Data @{ ok = $true }
+
+    $fs = $null
+    try {
+        $fs = [IO.File]::Create($tmp)
+        $index = 0
+        $total = [int64]0
+        $binOk = ($Global:ServerFeats -contains 'binchunk')
+        $gzOk = ($Global:ServerFeats -contains 'gzip')
+        while ($true) {
+            if ($binOk) {
+                # v2.3: сырой чанк (+gzip) с метаданными в заголовках
+                $q = "/transfer/$tid/chunk?index=$index&bin=1"
+                if ($gzOk) { $q = $q + '&gz=1' }
+                $r = Invoke-ApiRawResponse -Method 'Get' -Path $q -Retries 6 -TimeoutSec 180
+                if ((Get-RespHeader -Response $r -Name 'x-eof') -eq '1') { break }
+                $ms = New-Object System.IO.MemoryStream
+                try {
+                    if ($r.RawContentStream) {
+                        $r.RawContentStream.Position = 0
+                        $r.RawContentStream.CopyTo($ms)
+                    }
+                } catch { }
+                $bytes = $ms.ToArray()
+                $ms.Close()
+                if ((Get-RespHeader -Response $r -Name 'x-gz') -eq '1') {
+                    $bytes = Expand-Bytes -Data $bytes
+                }
+                if ($bytes.Length -eq 0) { break }
+                $fs.Write($bytes, 0, $bytes.Length)
+                $total += $bytes.Length
+                $Global:BridgeLastHeartbeat = Get-Date
+                if ((Get-RespHeader -Response $r -Name 'x-last') -eq '1') { break }
+                $index++
+            } else {
+                $r = Invoke-Api -Method 'Get' -Path ("/transfer/$tid/chunk?index=" + $index) -Retries 6 -TimeoutSec 120
+                if ($null -eq $r -or $r.eof) { break }
+                $bytes = [Convert]::FromBase64String([string]$r.dataB64)
+                $fs.Write($bytes, 0, $bytes.Length)
+                $total += $bytes.Length
+                $Global:BridgeLastHeartbeat = Get-Date
+                if ($r.last) { break }
+                $index++
+            }
+        }
+        $fs.Dispose()
+        $fs = $null
+        $hash = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLower()
+        $expected = ''
+        if ($payload.sha256) { $expected = ([string]$payload.sha256).ToLower() }
+        if ($expected -and $hash -ne $expected) {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            throw 'Контрольная сумма SHA256 не совпала'
+        }
+        if (Test-Path -LiteralPath $dest -PathType Leaf) { Remove-Item -LiteralPath $dest -Force }
+        Move-Item -LiteralPath $tmp -Destination $dest -Force
+        Invoke-Api -Method 'Post' -Path ("/transfer/$tid/done") -BodyObj @{ sha256 = $hash } -Retries 6 -TimeoutSec 60 | Out-Null
+        Write-Log ("Получен файл: " + $payload.path + " (" + $total + " байт)")
+    } catch {
+        if ($fs) { $fs.Dispose() }
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        $msg = $_.Exception.Message
+        Fail-Transfer -TransferId $tid -Message $msg
+        Write-Log ("Ошибка приёма файла " + $payload.path + ": " + $msg)
+    }
+    return $null
+}
+
+function Invoke-BridgeCommand {
+    param($cmd)
+    $payload = $cmd.payload
+    if ($null -eq $payload) { $payload = @{} }
+    switch ([string]$cmd.type) {
+        'ping'          { return @{ ok = $true; info = $Info; time = (Get-Date).ToString('s') } }
+        'stat'          { return Invoke-Stat $payload }
+        'list'          { return Get-Listing $payload }
+        'mkdir'         { return New-Dir $payload }
+        'delete'        { return Remove-BridgeItem $payload }
+        'move'          { return Move-BridgeItem $payload }
+        'download_init' { return Invoke-DownloadTransfer -cmd $cmd -payload $payload }
+        'upload_init'   { return Invoke-UploadTransfer -cmd $cmd -payload $payload }
+        'exec'          { return Start-ExecTask -cmd $cmd -payload $payload }
+        'exec_start'    { return Start-BackgroundProc -payload $payload }
+        'proc_read'     { return Read-BackgroundProc -payload $payload }
+        'proc_write'    { return Write-BackgroundProc -payload $payload }
+        'proc_kill'     { return Kill-BackgroundProc -payload $payload }
+        'proc_list'     { return List-BackgroundProcs }
+        'read_text'     { return Read-TextFile -payload $payload }
+        'write_text'    { return Write-TextFileCmd -payload $payload }
+        'restart'       { return Invoke-Restart -cmd $cmd }
+        default         { throw ("Неизвестная команда: " + $cmd.type) }
+    }
+}
+
+# ============ Внутренний сторожевой таймер (от зависаний) ============
+
+$Global:BridgeLastHeartbeat = Get-Date
+try {
+    $watchdog = New-Object -TypeName System.Timers.Timer -ArgumentList 60000
+    Register-ObjectEvent -InputObject $watchdog -EventName Elapsed -Action {
+        try {
+            $last = [datetime]$Global:BridgeLastHeartbeat
+            if (((Get-Date) - $last).TotalMinutes -gt 10) {
+                Write-Host '[watchdog] Основной цикл завис — принудительный перезапуск моста.'
+                Stop-Process -Id $PID -Force
+            }
+        } catch { }
+    } | Out-Null
+    $watchdog.Start()
+} catch {
+    Write-Log 'Не удалось запустить сторожевой таймер (продолжаю без него).'
+}
+
+# ============ Главный цикл ============
+
+$Global:BridgeTasks = @{}
+
+Write-Log ("Z.ai Bridge запущен v" + $script:BridgeVersion + " (exec: " + $script:ExecAvailable + ")")
+Write-Log ("Папка:  " + $script:Root)
+Write-Log ("Сервер: " + $Url)
+Write-Host ''
+Write-Host '  Мост работает. Держите это окно открытым, пока нужен доступ к папке.'
+Write-Host '  Остановить: закройте окно (или Ctrl+C, затем Y для завершения bat).'
+Write-Host ''
+
+$pollBody = @{ clientId = $ClientGuid; info = $Info }
+$Global:ServerFeats = @()
+
+while ($true) {
+    $Global:BridgeLastHeartbeat = Get-Date
+    Update-ExecTasks
+    $commands = $null
+    try {
+        $resp = Invoke-Api -Method 'Post' -Path '/poll' -BodyObj $pollBody -Retries 2 -TimeoutSec 25
+        if ($resp) {
+            $commands = $resp.commands
+            if ($resp.feats) { $Global:ServerFeats = @($resp.feats) }
+        }
+    } catch {
+        $pollErr = [string]$_.Exception.Message
+        if ($pollErr -like '*HTTP 409*') {
+            Write-Log 'Другой экземпляр моста ещё числится активным (это нормально сразу после перезапуска). Жду 5 с...'
+            Start-Sleep -Seconds 5
+        } else {
+            Write-Log ("Ошибка опроса сервера: " + $pollErr)
+            Start-Sleep -Seconds 3
+        }
+    }
+
+    if ($commands -and @($commands).Count -gt 0) {
+        foreach ($c in @($commands)) {
+            $desc = ''
+            try { $desc = [string]$c.payload.path } catch { $desc = '' }
+            Write-Log ("Команда: " + $c.type + " " + $desc)
+            try {
+                $res = Invoke-BridgeCommand -cmd $c
+                if ($null -ne $res) { Send-Result -Id $c.id -Ok $true -Data $res }
+            } catch {
+                $msg = $_.Exception.Message
+                Write-Log ("Ошибка выполнения " + $c.type + ": " + $msg)
+                try { Send-Result -Id $c.id -Ok $false -ErrorMessage $msg } catch { }
+            }
+        }
+    } else {
+        Start-Sleep -Milliseconds 900
+    }
+}

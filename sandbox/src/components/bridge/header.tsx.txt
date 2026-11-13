@@ -1,0 +1,102 @@
+"use client";
+
+// Шапка дашборда: логотип, статус моста, строка о клиенте.
+
+import { Cable, Loader2, WifiOff } from "lucide-react";
+
+import { Badge } from "@/components/ui/badge";
+import type { BridgeStatus } from "./types";
+
+interface BridgeHeaderProps {
+  status: BridgeStatus | null;
+  apiDown: boolean;
+  /** При false шапка не прилипает к верху (когда выше есть общий таб-бар). */
+  sticky?: boolean;
+}
+
+export function BridgeHeader({ status, apiDown, sticky = true }: BridgeHeaderProps) {
+  const online = status?.online ?? false;
+  const client = status?.client ?? null;
+  const lastSeenTitle =
+    status?.lastSeenAt != null
+      ? `Последняя связь: ${new Date(status.lastSeenAt).toLocaleString("ru-RU")}`
+      : "Мост ещё не подключался";
+
+  return (
+    <header
+      className={`${sticky ? "sticky top-0 z-20 " : ""}border-b border-zinc-800/60 bg-zinc-950/90 backdrop-blur supports-[backdrop-filter]:bg-zinc-950/75`}
+    >
+      <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center gap-x-4 gap-y-2 px-4 py-4 sm:px-6">
+        <div className="flex min-w-0 flex-1 items-center gap-3">
+          <div
+            className="flex size-10 shrink-0 items-center justify-center rounded-lg border border-emerald-500/30 bg-emerald-500/10"
+            aria-hidden="true"
+          >
+            <Cable className="size-5 text-emerald-500" />
+          </div>
+          <div className="min-w-0">
+            <h1 className="truncate text-lg font-semibold leading-tight text-zinc-50">Z.ai Bridge</h1>
+            <p className="truncate text-xs text-zinc-400 sm:text-sm">
+              Прямая связь песочницы с вашей папкой на ПК
+            </p>
+          </div>
+        </div>
+
+        <div className="flex w-full flex-col items-start gap-1.5 sm:ml-auto sm:w-auto sm:items-end">
+          <span aria-live="polite">
+            {status === null ? (
+              apiDown ? (
+                <Badge
+                  variant="outline"
+                  title="Бэкенд дашборда недоступен — повторяем попытку"
+                  className="gap-1.5 border-zinc-700 bg-zinc-900/80 text-zinc-400"
+                >
+                  <WifiOff className="size-3" aria-hidden="true" />
+                  Нет связи с сервером
+                </Badge>
+              ) : (
+                <Badge
+                  variant="outline"
+                  className="gap-1.5 border-zinc-700 bg-zinc-900/80 text-zinc-400"
+                >
+                  <Loader2 className="size-3 animate-spin" aria-hidden="true" />
+                  Проверка…
+                </Badge>
+              )
+            ) : online ? (
+              <Badge
+                variant="outline"
+                title={lastSeenTitle}
+                className="gap-2 border-emerald-800/60 bg-emerald-950/40 text-emerald-400"
+              >
+                <span className="relative flex size-2" aria-hidden="true">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
+                  <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+                </span>
+                Онлайн
+              </Badge>
+            ) : (
+              <Badge
+                variant="outline"
+                title={lastSeenTitle}
+                className="gap-1.5 border-red-900/60 bg-red-950/40 text-red-400"
+              >
+                <WifiOff className="size-3" aria-hidden="true" />
+                Офлайн
+              </Badge>
+            )}
+          </span>
+
+          {online && client && (
+            <p
+              className="max-w-full truncate text-xs text-zinc-500 sm:max-w-md"
+              title={`${client.computer} • ${client.user} • ${client.folder}\n${client.os} • PowerShell ${client.psVersion} • Bridge ${client.bridgeVersion}`}
+            >
+              {client.computer} • {client.user} • {client.folder}
+            </p>
+          )}
+        </div>
+      </div>
+    </header>
+  );
+}

@@ -1,0 +1,57 @@
+import fs from 'fs'
+import { db } from '@/lib/db'
+import {
+  requireBridgeAuth,
+  jerr,
+  jok,
+  clampPath,
+  sanitizeStagedName,
+  stagedPath,
+  sha256File,
+  MAX_FILE_SIZE,
+} from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * POST /api/bridge/push — отправить staging-файл песочницы на ПК.
+ * Body: { stagedName: 'report.zip', path: 'Входящие/report.zip' }
+ * Файл должен быть предварительно загружен через PUT /api/bridge/file/<stagedName>.
+ */
+export async function POST(request: Request) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const body = (await request.json().catch(() => ({}))) as {
+    stagedName?: string
+    path?: string
+  }
+  const stagedName = sanitizeStagedName(body.stagedName)
+  if (!stagedName) return jerr('Некорректное имя файла в песочнице (допустимы A-Z a-z 0-9 . _ -)')
+
+  const path = clampPath(body.path)
+  if (!path.trim()) return jerr('Не указан путь назначения на ПК')
+
+  const src = stagedPath(stagedName)
+  if (!fs.existsSync(src)) {
+    return jerr('Файл не найден в песочнице. Сначала загрузите его: PUT /api/bridge/file/<name>', 404)
+  }
+  const size = fs.statSync(src).size
+  if (size > MAX_FILE_SIZE) {
+    return jerr(`Файл слишком большой (${size} байт). Предел — 2 ГБ.`)
+  }
+  const sha256 = await sha256File(src)
+
+  const transfer = await db.bridgeTransfer.create({
+    data: { direction: 'sb2pc', path, stagedName, size, sha256, status: 'pending' },
+  })
+  await db.bridgeCommand.create({
+    data: {
+      type: 'upload_init',
+      payload: JSON.stringify({ transferId: transfer.id, path, size, sha256, stagedName }),
+      transferId: transfer.id,
+    },
+  })
+
+  return jok({ transferId: transfer.id })
+}

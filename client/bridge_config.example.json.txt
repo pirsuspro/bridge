@@ -1,0 +1,5 @@
+{
+    "url":  "https://АДРЕС-ВАШЕЙ-ПЕСОЧНИЦЫ.space-z.ai",
+    "token": "ВАШ-ТОКЕН-МОСТА",
+    "folder": "C:\\zai-share"
+}

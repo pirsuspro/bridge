@@ -1,0 +1,104 @@
+"use client";
+
+// Карточка «Журнал»: последние 30 операций моста (GET /api/bridge/log).
+// Поллинг выполняется на уровне страницы (общий интервал 5 сек со статусом).
+
+import { Check, Loader2, ScrollText, X } from "lucide-react";
+
+import { Badge } from "@/components/ui/badge";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+import { CARD_DARK } from "./styles";
+import type { LogEntry, LogStatus } from "./types";
+import { formatClock } from "./utils";
+
+function StatusIcon({ status, error }: { status: LogStatus; error: string | null }) {
+  if (status === "done") {
+    return <Check className="size-3.5 shrink-0 text-emerald-500" aria-label="Выполнено" />;
+  }
+  if (status === "failed") {
+    return (
+      <span title={error ?? "Ошибка"} className="inline-flex">
+        <X className="size-3.5 shrink-0 text-red-500" aria-label="Ошибка" />
+      </span>
+    );
+  }
+  if (status === "picked") {
+    return (
+      <Loader2
+        className="size-3.5 shrink-0 animate-spin text-amber-500"
+        aria-label="Мост выполняет операцию"
+      />
+    );
+  }
+  return <Loader2 className="size-3.5 shrink-0 animate-spin text-zinc-500" aria-label="Ожидание" />;
+}
+
+interface LogCardProps {
+  entries: LogEntry[] | null;
+}
+
+export function LogCard({ entries }: LogCardProps) {
+  return (
+    <Card className={`${CARD_DARK} flex h-full flex-col`}>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <ScrollText className="size-4 text-emerald-500" aria-hidden="true" />
+          Журнал
+        </CardTitle>
+        <CardDescription className="text-zinc-500">Последние операции моста</CardDescription>
+      </CardHeader>
+
+      <CardContent className="flex-1">
+        {entries === null ? (
+          <div className="flex flex-col gap-2.5" aria-label="Загрузка журнала">
+            {Array.from({ length: 5 }).map((_, index) => (
+              <div key={index} className="flex items-center gap-3">
+                <Skeleton className="h-3.5 w-16 bg-zinc-800" />
+                <Skeleton className="h-3.5 w-14 bg-zinc-800" />
+                <Skeleton className="h-3.5 flex-1 bg-zinc-800" />
+              </div>
+            ))}
+          </div>
+        ) : entries.length === 0 ? (
+          <div className="flex min-h-[10rem] flex-col items-center justify-center gap-2 p-6 text-center">
+            <ScrollText className="size-8 text-zinc-700" aria-hidden="true" />
+            <p className="text-sm text-zinc-500">Пусто</p>
+          </div>
+        ) : (
+          <ul
+            className="nice-scroll max-h-72 divide-y divide-zinc-800/50 overflow-y-auto"
+            aria-label="Записи журнала"
+          >
+            {entries.map((entry) => (
+              <li key={entry.id} className="flex items-center gap-2.5 px-1 py-2">
+                <span className="shrink-0 font-mono text-[11px] text-zinc-500">
+                  {formatClock(entry.createdAt)}
+                </span>
+                <Badge
+                  variant="outline"
+                  className="shrink-0 border-zinc-700 bg-zinc-800/50 font-mono text-[10px] text-zinc-300"
+                >
+                  {entry.type}
+                </Badge>
+                <span
+                  className="min-w-0 flex-1 truncate text-xs text-zinc-300"
+                  title={entry.error ?? entry.detail}
+                >
+                  {entry.detail || "—"}
+                </span>
+                <StatusIcon status={entry.status} error={entry.error} />
+              </li>
+            ))}
+          </ul>
+        )}
+      </CardContent>
+    </Card>
+  );
+}

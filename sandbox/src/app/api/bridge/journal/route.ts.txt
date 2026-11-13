@@ -1,0 +1,38 @@
+import fs from 'fs'
+import path from 'path'
+import { requireBridgeAuth, jok, jerr } from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+const JOURNAL_DIR = path.join(process.cwd(), 'journal')
+const JOURNAL_PATH = path.join(JOURNAL_DIR, 'JOURNAL.md')
+const MAX_LINES = 500
+
+/**
+ * GET /api/bridge/journal?lines=250 — хвост журнала прогресса агента
+ * (journal/JOURNAL.md в песочнице). Только чтение.
+ */
+export async function GET(request: Request) {
+  const auth = await requireBridgeAuth(request)
+  if (!auth) return jerr('Неверный токен моста', 401)
+
+  const url = new URL(request.url)
+  const rawLines = parseInt(url.searchParams.get('lines') ?? '250', 10)
+  const lines = Math.min(Math.max(Number.isFinite(rawLines) ? rawLines : 250, 10), MAX_LINES)
+
+  try {
+    const [stat, content] = await Promise.all([
+      fs.promises.stat(JOURNAL_PATH),
+      fs.promises.readFile(JOURNAL_PATH, 'utf8'),
+    ])
+    const allLines = content.split('\n')
+    return jok({
+      text: allLines.slice(-lines).join('\n'),
+      updatedAt: stat.mtime.toISOString(),
+      size: stat.size,
+      totalLines: allLines.length,
+    })
+  } catch {
+    return jok({ text: '', updatedAt: null, size: 0, totalLines: 0 })
+  }
+}

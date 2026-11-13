@@ -1,0 +1,61 @@
+import { db } from '@/lib/db'
+import { requireBridgeAuth, jok, jerr } from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+const MAX_TEXT_CHARS = 4000
+
+/**
+ * GET /api/bridge/chat?limit=100 — история чата + счётчик необработанных сообщений.
+ */
+export async function GET(request: Request) {
+  const auth = await requireBridgeAuth(request)
+  if (!auth) return jerr('Неверный токен моста', 401)
+
+  const url = new URL(request.url)
+  const rawLimit = parseInt(url.searchParams.get('limit') ?? '100', 10)
+  const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 100, 1), 300)
+
+  const [rows, pendingCount] = await Promise.all([
+    db.bridgeChatMessage.findMany({ orderBy: { createdAt: 'desc' }, take: limit }),
+    db.bridgeChatMessage.count({ where: { role: 'user', status: 'new' } }),
+  ])
+
+  return jok({
+    messages: rows
+      .reverse()
+      .map((m) => ({
+        id: m.id,
+        role: m.role,
+        text: m.text,
+        status: m.status,
+        createdAt: m.createdAt.toISOString(),
+      })),
+    pendingCount,
+  })
+}
+
+/**
+ * POST /api/bridge/chat {text} — сообщение пользователя агенту (через UI).
+ */
+export async function POST(request: Request) {
+  const auth = await requireBridgeAuth(request)
+  if (!auth) return jerr('Неверный токен моста', 401)
+
+  let body: { text?: unknown }
+  try {
+    body = (await request.json()) as { text?: unknown }
+  } catch {
+    return jerr('Некорректный JSON')
+  }
+
+  const text = String(body.text ?? '')
+    .trim()
+    .slice(0, MAX_TEXT_CHARS)
+  if (!text) return jerr('Пустое сообщение')
+
+  const msg = await db.bridgeChatMessage.create({
+    data: { role: 'user', text, status: 'new' },
+  })
+  return jok({ id: msg.id })
+}

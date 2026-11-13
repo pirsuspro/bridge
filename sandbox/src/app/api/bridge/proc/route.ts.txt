@@ -1,0 +1,108 @@
+import { db } from '@/lib/db'
+import {
+  requireBridgeAuth,
+  jerr,
+  jok,
+  jappErr,
+  sweep,
+  sleep,
+  clampCmd,
+  clampPath,
+  sanitizeEnv,
+  ACTION_WAIT_MS,
+  PROC_MAX_OUTPUT_CHARS,
+} from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+interface ProcPayload {
+  cmd?: string
+  cwd?: string
+  env?: Record<string, string>
+  handle?: string
+  fromOut?: number
+  fromErr?: number
+  maxChars?: number
+  input?: string
+  newline?: boolean
+}
+
+async function queueAndWait(type: string, payload: ProcPayload) {
+  const cmd = await db.bridgeCommand.create({
+    data: { type, payload: JSON.stringify(payload) },
+  })
+  const deadline = Date.now() + ACTION_WAIT_MS
+  let ticks = 0
+  while (Date.now() < deadline) {
+    await sleep(300)
+    ticks++
+    if (ticks % 15 === 0) await sweep()
+    const c = await db.bridgeCommand.findUnique({ where: { id: cmd.id } })
+    if (!c) break
+    if (c.status === 'done') {
+      return jok({
+        data: c.result ? (JSON.parse(c.result) as unknown) : null,
+        commandId: c.id,
+      })
+    }
+    if (c.status === 'failed') {
+      return jappErr(c.error || 'Ошибка выполнения на ПК')
+    }
+  }
+  return jerr('Таймаут ожидания ответа моста (мост офлайн или занят)', 504)
+}
+
+/**
+ * POST /api/bridge/proc — управление фоновыми процессами на ПК.
+ *
+ * op=start: { cmd, cwd?, env? }                          -> { handle, pid, cmd }
+ * op=read:  { handle, fromOut?, fromErr?, maxChars? }     -> { stdout, stderr, nextOut, nextErr, running, exitCode?, ... }
+ * op=write: { handle, input, newline? }                   -> { ok } (stdin)
+ * op=kill:  { handle }                                    -> { ok }
+ * op=list:  {}                                            -> { procs: [...] }
+ */
+export async function POST(request: Request) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const body = (await request.json().catch(() => ({}))) as ProcPayload & { op?: string }
+  const op = String(body.op ?? '')
+
+  switch (op) {
+    case 'start': {
+      const cmd = clampCmd(body.cmd)
+      if (!cmd.trim()) return jerr('Пустая команда')
+      const env = sanitizeEnv(body.env)
+      if (env === null) return jerr('Некорректный env')
+      const payload: ProcPayload = { cmd, cwd: clampPath(body.cwd), env }
+      return queueAndWait('exec_start', payload)
+    }
+    case 'read': {
+      const handle = String(body.handle ?? '').trim()
+      if (!handle) return jerr('Не указан handle процесса')
+      const fromOut = Number.isInteger(Number(body.fromOut)) && Number(body.fromOut) >= 0 ? Number(body.fromOut) : 0
+      const fromErr = Number.isInteger(Number(body.fromErr)) && Number(body.fromErr) >= 0 ? Number(body.fromErr) : 0
+      let maxChars = Number(body.maxChars)
+      if (!Number.isFinite(maxChars) || maxChars <= 0) maxChars = 100_000
+      maxChars = Math.min(maxChars, PROC_MAX_OUTPUT_CHARS)
+      return queueAndWait('proc_read', { handle, fromOut, fromErr, maxChars })
+    }
+    case 'write': {
+      const handle = String(body.handle ?? '').trim()
+      if (!handle) return jerr('Не указан handle процесса')
+      const input = String(body.input ?? '').slice(0, 100_000)
+      const payload: ProcPayload = { handle, input, newline: body.newline !== false }
+      return queueAndWait('proc_write', payload)
+    }
+    case 'kill': {
+      const handle = String(body.handle ?? '').trim()
+      if (!handle) return jerr('Не указан handle процесса')
+      return queueAndWait('proc_kill', { handle })
+    }
+    case 'list': {
+      return queueAndWait('proc_list', {})
+    }
+    default:
+      return jerr(`Неизвестная операция: ${op || '(пусто)'}. Доступны: start, read, write, kill, list`)
+  }
+}

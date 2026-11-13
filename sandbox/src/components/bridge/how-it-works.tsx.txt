@@ -1,0 +1,60 @@
+"use client";
+
+// Секция «Как это работает» — три ключевых свойства моста.
+
+import { motion } from "framer-motion";
+import { FolderLock, KeyRound, Network } from "lucide-react";
+
+import { Card, CardContent } from "@/components/ui/card";
+import { CARD_DARK } from "./styles";
+
+const ITEMS = [
+  {
+    icon: Network,
+    title: "Без настройки сети",
+    text: "Мост сам подключается к песочнице из вашей сети — открывать порты и настраивать роутер не нужно",
+  },
+  {
+    icon: FolderLock,
+    title: "Только ваша папка",
+    text: "Все операции выполняются только внутри выбранной вами папки — выход за её пределы заблокирован",
+  },
+  {
+    icon: KeyRound,
+    title: "Защищено токеном",
+    text: "Связь защищена личным токеном; каждое действие попадает в журнал",
+  },
+] as const;
+
+export function HowItWorks() {
+  return (
+    <section aria-labelledby="how-it-works-title" className="flex flex-col gap-4">
+      <h2 id="how-it-works-title" className="text-lg font-semibold text-zinc-100">
+        Как это работает
+      </h2>
+      <div className="grid gap-4 sm:grid-cols-3">
+        {ITEMS.map((item, index) => (
+          <motion.div
+            key={item.title}
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.3, delay: index * 0.08 }}
+          >
+            <Card className={`${CARD_DARK} h-full py-4`}>
+              <CardContent className="flex h-full flex-col gap-2.5 px-4">
+                <span
+                  className="flex size-9 items-center justify-center rounded-lg border border-emerald-500/30 bg-emerald-500/10"
+                  aria-hidden="true"
+                >
+                  <item.icon className="size-4.5 text-emerald-500" />
+                </span>
+                <h3 className="text-sm font-semibold text-zinc-100">{item.title}</h3>
+                <p className="text-xs leading-relaxed text-zinc-400">{item.text}</p>
+              </CardContent>
+            </Card>
+          </motion.div>
+        ))}
+      </div>
+    </section>
+  );
+}

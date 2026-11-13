@@ -1,0 +1,119 @@
+import fs from 'fs'
+import { createReadStream, createWriteStream } from 'node:fs'
+import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import type { ReadableStream as NodeWebReadableStream } from 'node:stream/web'
+import {
+  requireBridgeAuth,
+  jerr,
+  jok,
+  ensureDirs,
+  sanitizeStagedName,
+  stagedPath,
+  sha256File,
+  MAX_FILE_SIZE,
+} from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+function toWebStream(nodeStream: fs.ReadStream): ReadableStream<Uint8Array> {
+  // Readable.toWeb доступен и в Node, и в Bun
+  return Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>
+}
+
+/**
+ * GET /api/bridge/file/[name] — скачать staging-файл песочницы (binary, attachment).
+ */
+export async function GET(
+  request: Request,
+  { params }: { params: Promise<{ name: string }> }
+) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const { name: rawName } = await params
+  const name = sanitizeStagedName(decodeURIComponent(rawName))
+  if (!name) return jerr('Некорректное имя файла')
+
+  const p = stagedPath(name)
+  if (!fs.existsSync(p)) return jerr('Файл не найден в песочнице', 404)
+  const size = fs.statSync(p).size
+
+  try {
+    const stream = toWebStream(createReadStream(p))
+    return new Response(stream, {
+      headers: {
+        'content-type': 'application/octet-stream',
+        'content-length': String(size),
+        'content-disposition': `attachment; filename="${name}"`,
+        'cache-control': 'no-store',
+      },
+    })
+  } catch {
+    const buf = await fs.promises.readFile(p)
+    return new Response(new Uint8Array(buf), {
+      headers: {
+        'content-type': 'application/octet-stream',
+        'content-length': String(buf.length),
+        'content-disposition': `attachment; filename="${name}"`,
+        'cache-control': 'no-store',
+      },
+    })
+  }
+}
+
+/**
+ * PUT /api/bridge/file/[name] — положить файл в песочницу (raw-байты в теле).
+ */
+export async function PUT(
+  request: Request,
+  { params }: { params: Promise<{ name: string }> }
+) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const { name: rawName } = await params
+  const name = sanitizeStagedName(decodeURIComponent(rawName))
+  if (!name) return jerr('Некорректное имя файла (допустимы A-Z a-z 0-9 . _ -, без точек в начале)')
+
+  ensureDirs()
+  const p = stagedPath(name)
+
+  try {
+    if (request.body) {
+      const nodeStream = Readable.fromWeb(request.body as unknown as NodeWebReadableStream<Uint8Array>)
+      await pipeline(nodeStream, createWriteStream(p))
+    } else {
+      await fs.promises.writeFile(p, Buffer.alloc(0))
+    }
+  } catch (e) {
+    return jerr(`Не удалось сохранить файл: ${e instanceof Error ? e.message : String(e)}`, 500)
+  }
+
+  const size = fs.statSync(p).size
+  if (size > MAX_FILE_SIZE) {
+    await fs.promises.rm(p, { force: true })
+    return jerr('Файл больше 2 ГБ — не поддерживается')
+  }
+  const sha256 = await sha256File(p)
+
+  return jok({ name, size, sha256 })
+}
+
+/**
+ * DELETE /api/bridge/file/[name] — удалить staging-файл песочницы.
+ */
+export async function DELETE(
+  request: Request,
+  { params }: { params: Promise<{ name: string }> }
+) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const { name: rawName } = await params
+  const name = sanitizeStagedName(decodeURIComponent(rawName))
+  if (!name) return jerr('Некорректное имя файла')
+
+  await fs.promises.rm(stagedPath(name), { force: true })
+  return jok({ name })
+}

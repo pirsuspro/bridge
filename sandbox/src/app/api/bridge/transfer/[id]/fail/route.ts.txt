@@ -1,0 +1,36 @@
+import fs from 'fs'
+import { db } from '@/lib/db'
+import { requireBridgeAuth, jerr, jok, tmpPath, setSetting } from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * POST /api/bridge/transfer/[id]/fail — агент на ПК сообщает о фатальной ошибке передачи.
+ * Body: { error?: string }
+ */
+export async function POST(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const { id } = await params
+  const t = await db.bridgeTransfer.findUnique({ where: { id } })
+  if (!t) return jerr('Передача не найдена', 404)
+
+  const body = (await request.json().catch(() => ({}))) as { error?: string }
+
+  if (t.status === 'pending' || t.status === 'active') {
+    await db.bridgeTransfer.update({
+      where: { id },
+      data: { status: 'failed', error: body.error || 'Ошибка передачи на стороне ПК' },
+    })
+    if (t.direction === 'pc2sb') {
+      await fs.promises.rm(tmpPath(id), { force: true }).catch(() => {})
+    }
+  }
+  await setSetting('lastSeenAt', new Date().toISOString())
+
+  return jok({})
+}

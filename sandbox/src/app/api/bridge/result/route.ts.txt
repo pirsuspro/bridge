@@ -1,0 +1,84 @@
+import { db } from '@/lib/db'
+import {
+  requireBridgeAuth,
+  jerr,
+  jok,
+  tmpPath,
+} from '@/lib/bridge'
+import fs from 'fs'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * POST /api/bridge/result — агент на ПК возвращает результат команды.
+ * Body: { id: string, ok: boolean, data?: unknown, error?: string }
+ */
+export async function POST(request: Request) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const body = (await request.json().catch(() => ({}))) as {
+    id?: string
+    ok?: boolean
+    data?: unknown
+    error?: string
+  }
+  const id = String(body.id ?? '')
+  if (!id) return jerr('Не указан id команды')
+
+  const cmd = await db.bridgeCommand.findUnique({ where: { id } })
+  if (!cmd) return jerr('Команда не найдена', 404)
+
+  // Корреляция передачи файла с командой инициализации
+  if (cmd.transferId && (cmd.type === 'download_init' || cmd.type === 'upload_init')) {
+    const tid = cmd.transferId
+    try {
+      if (body.ok) {
+        const size =
+          cmd.type === 'download_init' && body.data && typeof body.data === 'object'
+            ? Number((body.data as { size?: unknown }).size ?? 0)
+            : undefined
+        await db.bridgeTransfer.update({
+          where: { id: tid },
+          data: {
+            status: 'active',
+            ...(size !== undefined && Number.isFinite(size) ? { size: Math.trunc(size) } : {}),
+          },
+        })
+      } else {
+        await db.bridgeTransfer.update({
+          where: { id: tid },
+          data: { status: 'failed', error: body.error || 'Ошибка на стороне ПК' },
+        })
+        if (cmd.type === 'download_init') {
+          await fs.promises.rm(tmpPath(tid), { force: true }).catch(() => {})
+        }
+      }
+    } catch {
+      /* передача могла быть уже завершена */
+    }
+  }
+
+  if (cmd.status === 'picked') {
+    // W29: кэп результата 64 КБ (exec/list/read_text могли присылать мегабайты;
+    // большие файлы читаются передачами, а не result-колонкой)
+    let resultJson: string | null = null
+    if (body.data !== undefined && body.data !== null) {
+      resultJson = JSON.stringify(body.data)
+      if (resultJson.length > 65_536) {
+        resultJson = resultJson.slice(0, 65_536) + '…[обрезано: результат больше 64 КБ]'
+      }
+    }
+    await db.bridgeCommand.update({
+      where: { id },
+      data: {
+        status: body.ok ? 'done' : 'failed',
+        result: resultJson,
+        error: body.ok ? null : body.error || 'Ошибка выполнения на ПК',
+        doneAt: new Date(),
+      },
+    })
+  }
+
+  return jok({})
+}

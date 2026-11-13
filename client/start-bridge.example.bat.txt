@@ -1,0 +1,32 @@
+@echo off
+rem ============================================================
+rem  Z.ai Bridge — watchdog-лаунчер (ручной вариант, без загрузки)
+rem
+rem  Используйте этот файл, если bridge.ps1 уже лежит рядом
+rem  (например, скачан с страницы моста кнопкой "Скачать bridge.ps1").
+rem  Он вечно перезапускает мост при падении.
+rem  Остановить мост полностью: закройте это окно.
+rem
+rem  URL и токен bridge.ps1 возьмёт из bridge_config.json рядом
+rem  (или спросит при первом запуске и сохранит сам).
+rem ============================================================
+
+chcp 65001 >nul
+title Z.ai Bridge
+cd /d "%~dp0"
+
+if not exist "bridge.ps1" (
+    echo [error] bridge.ps1 не найден рядом с этим .bat.
+    echo [error] Скачайте его со страницы моста ^(кнопка "Скачать bridge.ps1"^)
+    echo [error] или используйте zai-bridge-setup.bat — он скачает сам.
+    pause
+    exit /b 1
+)
+
+:run
+powershell -NoProfile -ExecutionPolicy Bypass -File "bridge.ps1"
+echo.
+echo [watchdog] Bridge остановлен. Перезапуск через 3 секунды...
+echo [watchdog] Закройте это окно, чтобы остановить мост полностью.
+timeout /t 3 /nobreak >nul
+goto run

@@ -1,0 +1,48 @@
+// ===== Z.ai Bridge v2: очередь команд, передачи файлов, настройки =====
+
+// Очередь команд для агента на ПК пользователя
+model BridgeCommand {
+  id         String    @id @default(cuid())
+  type       String // ping | stat | list | mkdir | delete | move | download_init | upload_init | exec | exec_start | proc_read | proc_write | proc_kill | proc_list | read_text | write_text | restart
+  payload    String // JSON
+  status     String    @default("pending") // pending | picked | done | failed
+  result     String? // JSON с результатом
+  error      String?
+  transferId String? // связь с передачей файла
+  createdAt  DateTime  @default(now())
+  pickedAt   DateTime?
+  doneAt     DateTime?
+}
+
+// Передачи файлов (чанкованные, с SHA256)
+model BridgeTransfer {
+  id         String   @id @default(cuid())
+  direction  String // pc2sb (ПК -> песочница) | sb2pc (песочница -> ПК)
+  path       String // путь внутри папки моста на ПК
+  stagedName String // имя файла в db/bridge-files песочницы
+  size       Int      @default(0)
+  bytesDone  Int      @default(0)
+  chunksDone Int      @default(0)
+  sha256     String?
+  status     String   @default("pending") // pending | active | complete | failed
+  error      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+// Ключевые настройки моста (token, lastSeenAt, clientId, clientInfo)
+model BridgeSetting {
+  key   String @id
+  value String
+}
+
+// Чат «пользователь <-> агент» через мост (команды агенту напрямую)
+model BridgeChatMessage {
+  id          String    @id @default(cuid())
+  role        String // user | agent | system
+  text        String
+  status      String    @default("new") // new | processed (для user-сообщений)
+  meta        String? // JSON (контекст: связанные команды, результаты)
+  createdAt   DateTime  @default(now())
+  processedAt DateTime?
+}

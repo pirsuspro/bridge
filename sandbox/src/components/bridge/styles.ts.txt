@@ -1,0 +1,15 @@
+// Общие Tailwind-константы тёмной темы Z.ai Bridge (zinc + emerald).
+
+export const CARD_DARK = "min-w-0 border-zinc-800 bg-zinc-900/60";
+
+export const BTN_PRIMARY = "h-10 bg-emerald-500 text-zinc-950 hover:bg-emerald-600";
+
+export const BTN_OUTLINE =
+  "h-10 border-zinc-700 bg-zinc-900/60 text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100";
+
+export const BTN_GHOST = "h-10 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100";
+
+export const INPUT_DARK =
+  "h-10 border-zinc-700 bg-zinc-950/60 text-zinc-100 placeholder:text-zinc-600 focus-visible:border-emerald-500/50 focus-visible:ring-emerald-500/20";
+
+export const DIALOG_DARK = "border-zinc-800 bg-zinc-900 text-zinc-100";

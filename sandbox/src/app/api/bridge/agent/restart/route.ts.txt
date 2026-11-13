@@ -1,0 +1,44 @@
+import { db } from '@/lib/db'
+import {
+  requireBridgeAuth,
+  jerr,
+  jok,
+  jappErr,
+  sleep,
+} from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * POST /api/bridge/agent/restart — перезапуск агента на ПК.
+ * Ставит команду restart; агент подтверждает результат и убивает свой процесс,
+ * а bat-лаунчер (zai-bridge-setup.bat) поднимает его заново через ~3 сек —
+ * уже с обновлённым bridge.ps1, если файл был заменён.
+ */
+export async function POST(request: Request) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const cmd = await db.bridgeCommand.create({
+    data: { type: 'restart', payload: JSON.stringify({}) },
+  })
+
+  // Агент отвечает до самоубийства, так что ждём недолго
+  const deadline = Date.now() + 30_000
+  while (Date.now() < deadline) {
+    await sleep(300)
+    const c = await db.bridgeCommand.findUnique({ where: { id: cmd.id } })
+    if (!c) break
+    if (c.status === 'done') {
+      return jok({
+        data: c.result ? (JSON.parse(c.result) as unknown) : null,
+        restarting: true,
+        note: 'Агент подтвердил перезапуск; онлайн он станет через ~5 сек.',
+      })
+    }
+    if (c.status === 'failed') {
+      return jappErr(c.error || 'Агент не смог перезапуститься')
+    }
+  }
+  return jerr('Таймаут ожидания ответа моста (мост офлайн или не поддерживает restart)', 504)
+}

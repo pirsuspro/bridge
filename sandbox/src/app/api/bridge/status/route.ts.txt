@@ -1,0 +1,41 @@
+import {
+  getBridgeToken,
+  getSetting,
+  sweep,
+  jok,
+  BRIDGE_VERSION,
+  ONLINE_WINDOW_MS,
+} from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * GET /api/bridge/status — статус моста (без авторизации: это источник токена для UI).
+ */
+export async function GET() {
+  await sweep()
+  const token = await getBridgeToken()
+  const lastSeenAt = await getSetting('lastSeenAt')
+  const clientInfoRaw = await getSetting('clientInfo')
+
+  let client: unknown = null
+  if (clientInfoRaw) {
+    try {
+      client = JSON.parse(clientInfoRaw)
+    } catch {
+      client = null
+    }
+  }
+
+  const online = Boolean(
+    lastSeenAt && Date.now() - new Date(lastSeenAt).getTime() < ONLINE_WINDOW_MS
+  )
+
+  return jok({
+    token,
+    online,
+    lastSeenAt: lastSeenAt || null,
+    client,
+    version: BRIDGE_VERSION,
+  })
+}

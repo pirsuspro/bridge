@@ -1,0 +1,88 @@
+import { NextResponse } from 'next/server'
+import { db } from '@/lib/db'
+import {
+  requireBridgeAuth,
+  jerr,
+  jok,
+  sweep,
+  touchClient,
+  getSetting,
+} from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * POST /api/bridge/poll — агент на ПК опрашивает сервер.
+ * Body: { clientId: string, info?: {...} }
+ * Возвращает до 8 pending-команд и помечает их picked.
+ */
+// v2.3: возможности сервера — агент включает бинарные чанки/gzip, если они есть
+const SERVER_FEATS = ['binchunk', 'gzip']
+
+export async function POST(request: Request) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const body = (await request.json().catch(() => ({}))) as {
+    clientId?: string
+    info?: unknown
+  }
+  const clientId = String(body.clientId ?? '')
+
+  // Защита от двух одновременно работающих экземпляров моста.
+  // С v2.1 агент хранит постоянный clientId в конфиге, поэтому при обычном
+  // перезапуске конфликта не будет; 409 — только если реально запущен другой агент.
+  const lastSeenAt = await getSetting('lastSeenAt')
+  const activeClient = await getSetting('clientId')
+  if (
+    clientId &&
+    activeClient &&
+    activeClient !== clientId &&
+    lastSeenAt &&
+    Date.now() - new Date(lastSeenAt).getTime() < 25_000
+  ) {
+    const ageMs = Date.now() - new Date(lastSeenAt).getTime()
+    const retryAfterSec = Math.max(1, Math.ceil((25_000 - ageMs) / 1000))
+    return NextResponse.json(
+      {
+        ok: false,
+        error:
+          'Другой экземпляр моста активен (последний опрос секунду назад). Если вы просто перезапустили мост — всё в порядке, агент подключится сам.',
+        retryAfterSec,
+      },
+      { status: 409 }
+    )
+  }
+
+  await touchClient(clientId, body.info)
+  await sweep()
+
+  const pending = await db.bridgeCommand.findMany({
+    where: { status: 'pending' },
+    orderBy: { createdAt: 'asc' },
+    take: 8,
+  })
+
+  if (pending.length > 0) {
+    const ids = pending.map((c) => c.id)
+    const res = await db.bridgeCommand.updateMany({
+      where: { id: { in: ids }, status: 'pending' },
+      data: { status: 'picked', pickedAt: new Date() },
+    })
+    if (res.count > 0) {
+      const picked = await db.bridgeCommand.findMany({
+        where: { id: { in: ids }, status: 'picked' },
+        orderBy: { createdAt: 'asc' },
+      })
+      return jok({
+        commands: picked.map((c) => ({
+          id: c.id,
+          type: c.type,
+          payload: JSON.parse(c.payload) as unknown,
+        })),
+        feats: SERVER_FEATS,
+      })
+    }
+  }
+  return jok({ commands: [], feats: SERVER_FEATS })
+}

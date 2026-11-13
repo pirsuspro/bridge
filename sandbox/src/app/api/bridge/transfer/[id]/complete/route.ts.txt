@@ -1,0 +1,94 @@
+import fs from 'fs'
+import { db } from '@/lib/db'
+import {
+  requireBridgeAuth,
+  jerr,
+  jok,
+  ensureDirs,
+  stagedPath,
+  tmpPath,
+  sha256File,
+  setSetting,
+} from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * POST /api/bridge/transfer/[id]/complete — агент на ПК завершил отправку файла (pc2sb).
+ * Body: { sha256: string }
+ * Сервер проверяет размер и хэш, перемещает tmp -> db/bridge-files/<stagedName>.
+ */
+export async function POST(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const { id } = await params
+  const t = await db.bridgeTransfer.findUnique({ where: { id } })
+  if (!t) return jerr('Передача не найдена', 404)
+  if (t.direction !== 'pc2sb') return jerr('Неверное направление передачи', 400)
+  if (t.status === 'complete') return jok({ stagedName: t.stagedName, sha256: t.sha256, size: t.size })
+  if (t.status !== 'active' && t.status !== 'pending') {
+    return jerr(`Передача уже завершена (${t.status})`, 400)
+  }
+
+  const body = (await request.json().catch(() => ({}))) as { sha256?: string }
+  const claimed = String(body.sha256 ?? '').toLowerCase()
+
+  ensureDirs()
+  const tp = tmpPath(id)
+
+  const fail = async (error: string) => {
+    await db.bridgeTransfer.update({ where: { id }, data: { status: 'failed', error } })
+    await fs.promises.rm(tp, { force: true }).catch(() => {})
+    return jerr(error)
+  }
+
+  // Пустой файл — чанков не было
+  if (!fs.existsSync(tp)) {
+    if (t.size === 0) {
+      await fs.promises.writeFile(stagedPath(t.stagedName), Buffer.alloc(0))
+      await db.bridgeTransfer.update({
+        where: { id },
+        data: {
+          status: 'complete',
+          bytesDone: 0,
+          size: 0,
+          sha256: claimed || null,
+          error: null,
+        },
+      })
+      await setSetting('lastSeenAt', new Date().toISOString())
+      return jok({ stagedName: t.stagedName, size: 0 })
+    }
+    return fail('Временный файл не найден (передача прервана)')
+  }
+
+  const actualSize = fs.statSync(tp).size
+  if (t.size > 0 && actualSize !== t.size) {
+    return fail(`Размер не совпал: заявлено ${t.size}, получено ${actualSize}`)
+  }
+
+  const hash = await sha256File(tp)
+  if (claimed && claimed !== hash) {
+    return fail('Контрольная сумма SHA256 не совпала — файл повреждён при передаче')
+  }
+
+  await fs.promises.rm(stagedPath(t.stagedName), { force: true })
+  await fs.promises.rename(tp, stagedPath(t.stagedName))
+  await db.bridgeTransfer.update({
+    where: { id },
+    data: {
+      status: 'complete',
+      bytesDone: actualSize,
+      size: t.size > 0 ? t.size : actualSize,
+      sha256: hash,
+      error: null,
+    },
+  })
+  await setSetting('lastSeenAt', new Date().toISOString())
+
+  return jok({ stagedName: t.stagedName, sha256: hash, size: actualSize })
+}

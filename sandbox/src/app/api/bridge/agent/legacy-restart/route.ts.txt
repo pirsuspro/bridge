@@ -1,0 +1,76 @@
+import { db } from '@/lib/db'
+import {
+  requireBridgeAuth,
+  jerr,
+  jok,
+  setSetting,
+  getSetting,
+  clampPath,
+  makeStagedName,
+} from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * POST /api/bridge/agent/legacy-restart — перезапуск агента v1.x через watchdog.
+ *
+ * Как работает: агент v1 отвечает на poll каждые ~1с и обновляет heartbeat.
+ * Если поставить флаг hangChunksUntil и инициировать вытягивание маленького
+ * файла, агент войдёт в chunk-цикл, а сервер не будет отвечать на чанк.
+ * Через 6 повторов по 120с (~12 мин без heartbeat) внутренний watchdog агента
+ * убьёт процесс, а zai-bridge-setup.bat перезапустит его за 3 секунды —
+ * уже с обновлённым bridge.ps1.
+ *
+ * Body: { hangSec?: number (default 900), probePath?: string (файл для зависания) }
+ *       { clear: true } — снять флаг без зависания.
+ */
+export async function POST(request: Request) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  const body = (await request.json().catch(() => ({}))) as {
+    hangSec?: unknown
+    probePath?: unknown
+    clear?: boolean
+  }
+
+  if (body.clear === true) {
+    await setSetting('hangChunksUntil', '')
+    return jok({ cleared: true })
+  }
+
+  // Уже висит?
+  const existing = await getSetting('hangChunksUntil')
+  if (existing && Date.now() < new Date(existing).getTime()) {
+    return jok({ alreadyHanging: true, until: existing })
+  }
+
+  let hangSec = Number(body.hangSec)
+  if (!Number.isFinite(hangSec) || hangSec <= 0) hangSec = 900
+  hangSec = Math.min(hangSec, 1800)
+
+  const probePath = clampPath(body.probePath) || 'bridge_probe.txt'
+
+  await setSetting('hangChunksUntil', new Date(Date.now() + hangSec * 1000).toISOString())
+
+  // Инициируем pc2sb-передачу маленького файла, чтобы агент зашёл в chunk-цикл
+  const stagedName = makeStagedName(probePath)
+  const transfer = await db.bridgeTransfer.create({
+    data: { direction: 'pc2sb', path: probePath, stagedName, status: 'pending' },
+  })
+  await db.bridgeCommand.create({
+    data: {
+      type: 'download_init',
+      payload: JSON.stringify({ transferId: transfer.id, path: probePath }),
+      transferId: transfer.id,
+    },
+  })
+
+  return jok({
+    hangSec,
+    until: new Date(Date.now() + hangSec * 1000).toISOString(),
+    probePath,
+    transferId: transfer.id,
+    note: 'Агент v1 зависнет на чанке; watchdog убьёт процесс ~через 10-12 мин, bat-лаунчер перезапустит с новым bridge.ps1',
+  })
+}

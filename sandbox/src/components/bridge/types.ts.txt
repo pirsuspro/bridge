@@ -1,0 +1,221 @@
+// Типы строгого контракта API Z.ai Bridge (см. /agent-ctx/2-a-backend.md)
+
+export interface BridgeClientInfo {
+  computer: string;
+  user: string;
+  os: string;
+  psVersion: string;
+  folder: string;
+  bridgeVersion: string;
+}
+
+export interface BridgeStatus {
+  ok: boolean;
+  error?: string;
+  token: string;
+  online: boolean;
+  lastSeenAt: string | null;
+  version: string;
+  client: BridgeClientInfo | null;
+}
+
+export type ActionOp = "list" | "stat" | "mkdir" | "delete" | "move" | "ping";
+
+export interface ActionBody {
+  op: ActionOp;
+  path?: string;
+  to?: string;
+  recursive?: boolean;
+}
+
+export interface FileEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: number;
+  mtime: string;
+}
+
+export interface ListResult {
+  path: string;
+  truncated: boolean;
+  entries: FileEntry[];
+}
+
+export interface ActionResult<T = ListResult> {
+  ok: boolean;
+  error?: string;
+  data?: T;
+}
+
+export type TransferDirection = "pc2sb" | "sb2pc";
+export type TransferStatus = "pending" | "active" | "complete" | "failed";
+
+export interface Transfer {
+  id: string;
+  direction: TransferDirection;
+  path: string;
+  stagedName: string;
+  size: number;
+  bytesDone: number;
+  status: TransferStatus;
+  error: string | null;
+  createdAt: string;
+}
+
+export type LogStatus = "done" | "failed" | "pending" | "picked";
+
+export interface LogEntry {
+  id: string;
+  type: string;
+  status: LogStatus;
+  detail: string;
+  error: string | null;
+  createdAt: string;
+}
+
+export interface PullResponse {
+  ok: boolean;
+  error?: string;
+  transferId?: string;
+  stagedName?: string;
+}
+
+export interface PushResponse {
+  ok: boolean;
+  error?: string;
+  transferId?: string;
+}
+
+export interface RotateResponse {
+  ok: boolean;
+  error?: string;
+  token?: string;
+}
+
+export interface TransfersResponse {
+  ok: boolean;
+  error?: string;
+  transfers?: Transfer[];
+}
+
+export interface LogResponse {
+  ok: boolean;
+  error?: string;
+  entries?: LogEntry[];
+}
+
+// ---------- v2: команды и процессы ----------
+
+export interface ExecResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+  stdoutEnc?: string;
+  stderrEnc?: string;
+  stdoutTrunc?: boolean;
+  stderrTrunc?: boolean;
+  durationMs: number;
+  timedOut: boolean;
+}
+
+export interface ExecResponse {
+  ok: boolean;
+  error?: string;
+  pending?: boolean;
+  commandId?: string;
+  timeoutSec?: number;
+  data?: ExecResult;
+}
+
+export type CommandState = "pending" | "picked" | "done" | "failed";
+
+export interface CommandStatus {
+  ok: boolean;
+  error?: string;
+  commandId: string;
+  type: string;
+  status: CommandState;
+  picked: boolean;
+  data?: ExecResult;
+}
+
+export interface ProcInfo {
+  handle: string;
+  pid: number;
+  cmd: string;
+  startedAt: string;
+  running: boolean;
+  exitCode?: number;
+  durationMs?: number;
+}
+
+export interface ProcReadResult {
+  handle: string;
+  pid: number;
+  running: boolean;
+  stdout: string;
+  stderr: string;
+  stdoutEnc?: string;
+  stderrEnc?: string;
+  nextOut: number;
+  nextErr: number;
+  exitCode?: number;
+  durationMs?: number;
+}
+
+export interface ProcListResult {
+  procs: ProcInfo[];
+}
+
+export interface ActionResultTyped<T> extends ActionResult<T> {
+  data?: T;
+}
+
+// ---------- v3: чат с агентом, журнал, память ----------
+
+export type ChatRole = "user" | "agent" | "system";
+
+export interface ChatMessage {
+  id: string;
+  role: ChatRole;
+  text: string;
+  status: string;
+  createdAt: string;
+}
+
+export interface ChatResponse {
+  ok: boolean;
+  error?: string;
+  messages?: ChatMessage[];
+  pendingCount?: number;
+}
+
+export interface ChatSendResponse {
+  ok: boolean;
+  error?: string;
+  id?: string;
+  processedCount?: number;
+}
+
+export interface JournalResponse {
+  ok: boolean;
+  error?: string;
+  text?: string;
+  updatedAt?: string | null;
+  size?: number;
+  totalLines?: number;
+}
+
+export interface MemoryFile {
+  path: string;
+  content: string;
+  size: number;
+}
+
+export interface MemoryResponse {
+  ok: boolean;
+  error?: string;
+  files?: MemoryFile[];
+  count?: number;
+}

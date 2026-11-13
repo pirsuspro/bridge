@@ -1,0 +1,27 @@
+import fs from 'fs'
+import { requireBridgeAuth, jerr, jok, ensureDirs, BRIDGE_FILES_DIR } from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * GET /api/bridge/files — список staging-файлов песочницы (db/bridge-files).
+ */
+export async function GET(request: Request) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  ensureDirs()
+  const dirents = await fs.promises.readdir(BRIDGE_FILES_DIR, { withFileTypes: true })
+  const files: { name: string; size: number; mtime: string }[] = []
+  for (const d of dirents) {
+    if (!d.isFile()) continue
+    try {
+      const st = await fs.promises.stat(`${BRIDGE_FILES_DIR}/${d.name}`)
+      files.push({ name: d.name, size: st.size, mtime: st.mtime.toISOString() })
+    } catch {
+      /* файл мог исчезнуть */
+    }
+  }
+  files.sort((a, b) => b.mtime.localeCompare(a.mtime))
+  return jok({ files })
+}

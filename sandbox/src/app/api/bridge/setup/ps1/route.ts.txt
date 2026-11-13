@@ -1,0 +1,35 @@
+import fs from 'fs'
+import path from 'path'
+import { requireBridgeAuth, jerr } from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+const PS1_PATH = path.join(process.cwd(), 'bridge-client', 'bridge.ps1')
+
+/**
+ * GET /api/bridge/setup/ps1 — скачать PowerShell-клиент моста.
+ * Отдаётся с BOM и CRLF, чтобы Windows PowerShell 5.1 корректно читал кириллицу.
+ */
+export async function GET(request: Request) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  if (!fs.existsSync(PS1_PATH)) {
+    return jerr('bridge.ps1 не найден на сервере', 500)
+  }
+
+  const raw = await fs.promises.readFile(PS1_PATH, 'utf8')
+  const crlf = raw.replace(/\r?\n/g, '\r\n')
+  // UTF-8 BOM — обязателен для PowerShell 5.1
+  const withBom = '\ufeff' + crlf
+  const buf = Buffer.from(withBom, 'utf8')
+
+  return new Response(new Uint8Array(buf), {
+    headers: {
+      'content-type': 'text/plain; charset=utf-8',
+      'content-length': String(buf.length),
+      'content-disposition': 'attachment; filename="bridge.ps1"',
+      'cache-control': 'no-store',
+    },
+  })
+}

@@ -1,0 +1,39 @@
+import { db } from '@/lib/db'
+import { requireBridgeAuth, jerr, jok, sweep } from '@/lib/bridge'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * GET /api/bridge/log — последние 30 команд (новые сверху).
+ */
+export async function GET(request: Request) {
+  const token = await requireBridgeAuth(request)
+  if (!token) return jerr('Неверный токен моста', 401)
+
+  await sweep()
+  const commands = await db.bridgeCommand.findMany({
+    orderBy: { createdAt: 'desc' },
+    take: 30,
+  })
+
+  const entries = commands.map((c) => {
+    let detail = ''
+    try {
+      const p = JSON.parse(c.payload) as { path?: string; from?: string }
+      detail = String(p.path ?? p.from ?? '')
+    } catch {
+      detail = ''
+    }
+    return {
+      id: c.id,
+      type: c.type,
+      status: c.status,
+      detail,
+      error: c.error,
+      createdAt: c.createdAt.toISOString(),
+      doneAt: c.doneAt ? c.doneAt.toISOString() : null,
+    }
+  })
+
+  return jok({ entries })
+}
